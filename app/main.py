@@ -1,0 +1,297 @@
+"""FastAPI application."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from app.cards import get_index
+from app.collection import parse_collection_csv
+from app.deck import parse_decklist
+from app.legality import (
+    analyze_deck,
+    analyze_sideboard,
+    build_export_sideboard,
+    build_final_deck,
+    build_sideboard_suggestion_rows,
+    build_suggestion_payload,
+    display_image_url,
+    resolve_name,
+)
+from app.suggest import suggest_replacements
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+app = FastAPI(title="edh2brawl", version="0.1.0")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class AnalyzeRequest(BaseModel):
+    decklist: str
+    format_key: str = Field(default="brawl", pattern="^(brawl|competitivebrawl)$")
+    commander: Optional[str] = None
+    replacements: dict[str, str] = Field(default_factory=dict)
+    role_overrides: dict[str, str] = Field(default_factory=dict)
+    rolls: dict[str, int] = Field(default_factory=dict)
+    cheap_overrides: dict[str, bool] = Field(default_factory=dict)
+    prefer_collection: bool = False
+    minimize_wildcards: bool = False
+    owned: dict[str, int] = Field(default_factory=dict)
+    include_suggestions: bool = True
+
+
+class SearchRequest(BaseModel):
+    query: str
+    format_key: str = "brawl"
+    color_identity: str = ""
+    exclude: list[str] = Field(default_factory=list)
+    limit: int = 15
+
+
+@app.on_event("startup")
+def startup() -> None:
+    idx = get_index()
+    try:
+        idx.refresh_if_needed()
+    except Exception:
+        pass
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/status")
+def status() -> dict[str, Any]:
+    idx = get_index()
+    return {
+        "cards_indexed": idx.row_count(),
+        "bulk_updated_at": idx.get_meta("bulk_updated_at"),
+    }
+
+
+@app.post("/api/index/refresh")
+def refresh_index(force: bool = True) -> dict[str, Any]:
+    idx = get_index()
+    try:
+        idx.build_from_bulk(force_download=force) if force else idx.refresh_if_needed()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"cards_indexed": idx.row_count(), "bulk_updated_at": idx.get_meta("bulk_updated_at")}
+
+
+@app.post("/api/collection/parse")
+async def parse_collection(file: UploadFile = File(...)) -> dict[str, Any]:
+    raw = await file.read()
+    idx = get_index()
+    known = idx.all_names() if idx.row_count() else set()
+    try:
+        result = parse_collection_csv(raw, known)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "format": result.format_detected,
+        "row_count": result.row_count,
+        "unique_cards": len(result.owned),
+        "owned": result.owned,
+    }
+
+
+@app.post("/api/analyze")
+def analyze(body: AnalyzeRequest) -> dict[str, Any]:
+    idx = get_index()
+    if idx.row_count() == 0:
+        raise HTTPException(
+            status_code=503,
+            detail="Card database not ready. Call POST /api/index/refresh or wait for startup download.",
+        )
+
+    parsed = parse_decklist(body.decklist, commander_hint=body.commander)
+    commander_name = body.replacements.get("__commander__") or body.commander
+    if not commander_name and parsed.commander_names:
+        commander_name = parsed.commander_names[0]
+
+    analysis = analyze_deck(idx, parsed, body.format_key, commander_override=commander_name or None)
+    sideboard_review = analyze_sideboard(
+        idx,
+        parsed.sideboard,
+        body.format_key,
+        analysis.color_identity,
+    )
+
+    rows: list[dict] = []
+    sideboard_rows: list[dict] = []
+    if body.include_suggestions:
+        rows = build_suggestion_payload(
+            idx,
+            analysis,
+            body.format_key,
+            body.owned,
+            body.replacements,
+            body.prefer_collection,
+            body.minimize_wildcards,
+            body.role_overrides,
+            body.rolls,
+            body.cheap_overrides,
+        )
+        sideboard_rows = build_sideboard_suggestion_rows(
+            idx,
+            sideboard_review,
+            analysis,
+            body.format_key,
+            body.owned,
+            body.replacements,
+            body.prefer_collection,
+            body.minimize_wildcards,
+            body.role_overrides,
+            body.rolls,
+            body.cheap_overrides,
+        )
+
+    pending = []
+    for r in rows:
+        if r.get("slot") == "commander":
+            if "__commander__" not in body.replacements:
+                pending.append(r)
+        elif r["illegal_name"] not in body.replacements:
+            pending.append(r)
+
+    final = None
+    wildcard_summary = None
+    if not pending:
+        cmd_name = body.replacements.get("__commander__", analysis.commander_name)
+        repl_main = {k: v for k, v in body.replacements.items() if k != "__commander__"}
+        final = build_final_deck(analysis, repl_main, idx, new_commander_name=cmd_name or None)
+        final["sideboard"] = build_export_sideboard(sideboard_review, body.replacements, idx)
+        wildcard_summary = _wildcard_summary(final, body.owned, idx)
+
+    return {
+        "commander": analysis.commander_name,
+        "commander_candidates": analysis.commander_candidates,
+        "color_identity": analysis.color_identity,
+        "deck_size": analysis.deck_size,
+        "expected_size": analysis.expected_size,
+        "illegal_count": len(rows) if body.include_suggestions else len(analysis.illegal),
+        "replacement_rows": rows,
+        "replacements": body.replacements,
+        "final_deck": final,
+        "wildcard_summary": wildcard_summary,
+        "has_collection": bool(body.owned),
+        "sideboard_count": len(parsed.sideboard),
+        "sideboard_review": sideboard_review,
+        "sideboard_replacement_rows": sideboard_rows,
+        "arena_export": _arena_export(final) if final else None,
+    }
+
+
+@app.post("/api/search")
+def search_cards(body: SearchRequest) -> dict[str, Any]:
+    idx = get_index()
+    names = idx.search_names(body.query, limit=body.limit * 3)
+    exclude = set(body.exclude)
+    out = []
+    for name in names:
+        if name in exclude:
+            continue
+        rec = idx.get(name)
+        if not rec:
+            continue
+        if rec.legality(body.format_key) != "legal":
+            continue
+        if body.color_identity and not all(c in body.color_identity for c in rec.color_identity):
+            continue
+        out.append(
+            {
+                "name": rec.name,
+                "mana_value": rec.mana_value,
+                "type_line": rec.type_line,
+                "image_url": display_image_url(rec.name, rec.image_url),
+                "rarity": rec.rarity,
+            }
+        )
+        if len(out) >= body.limit:
+            break
+    return {"results": out}
+
+
+@app.post("/api/suggest/one")
+def suggest_one(
+    illegal_name: str = Form(...),
+    format_key: str = Form("brawl"),
+    color_identity: str = Form(""),
+    exclude_json: str = Form("[]"),
+    owned_json: str = Form("{}"),
+    prefer_collection: bool = Form(False),
+    minimize_wildcards: bool = Form(False),
+) -> dict[str, Any]:
+    idx = get_index()
+    source = resolve_name(idx, illegal_name)
+    if not source:
+        raise HTTPException(status_code=404, detail="Card not found")
+    exclude = set(json.loads(exclude_json))
+    owned = json.loads(owned_json)
+    sugs = suggest_replacements(
+        idx,
+        source,
+        format_key,
+        color_identity,
+        exclude,
+        owned,
+        prefer_collection,
+        minimize_wildcards,
+    )
+    from app.legality import _suggestion_json
+
+    return {"suggestions": [_suggestion_json(s) for s in sugs]}
+
+
+def _wildcard_summary(final: dict, owned: dict[str, int], idx) -> dict[str, int]:
+    from app.collection import is_owned
+    from app.suggest import singleton_exempt
+
+    counts = {"common": 0, "uncommon": 0, "rare": 0, "mythic": 0, "owned": 0}
+    cards = []
+    if final.get("commander"):
+        cards.append(final["commander"]["name"])
+    cards.extend(c["name"] for c in final.get("main", []))
+    cards.extend(c["name"] for c in final.get("sideboard", []))
+    for name in cards:
+        rec = idx.get(name)
+        if rec and singleton_exempt(rec):
+            if is_owned(owned, name):
+                counts["owned"] += 1
+            continue
+        if is_owned(owned, name):
+            counts["owned"] += 1
+            continue
+        if not rec:
+            continue
+        r = rec.rarity
+        if r in counts:
+            counts[r] += 1
+    return counts
+
+
+def _arena_export(final: dict) -> str:
+    lines: list[str] = []
+    if final.get("commander"):
+        lines.append("Commander")
+        lines.append(f"1 {final['commander']['name']}")
+        lines.append("")
+    lines.append("Deck")
+    for c in final.get("main", []):
+        lines.append(f"1 {c['name']}")
+    sideboard = final.get("sideboard") or []
+    if sideboard:
+        lines.append("")
+        lines.append("Sideboard")
+        for c in sideboard:
+            lines.append(f"1 {c['name']}")
+    return "\n".join(lines)

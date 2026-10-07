@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>edh2brawl</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>edh2brawl</h1>
+    <p class="tagline">Commander list → Arena Brawl with legal replacements</p>
+    <p id="status" class="status">Loading card index…</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Decklist</h2>
+      <textarea id="decklist" rows="14" placeholder="Commander&#10;1 Your Commander&#10;&#10;Deck&#10;1 Sol Ring&#10;…"></textarea>
+      <div class="row">
+        <label>
+          Format
+          <select id="formatKey">
+            <option value="brawl">Brawl</option>
+            <option value="competitivebrawl">Competitive Brawl</option>
+          </select>
+        </label>
+        <label>
+          Commander (overrides last line)
+          <input type="text" id="commanderHint" placeholder="Optional — else blank line or last card" />
+        </label>
+      </div>
+      <div class="row toggles">
+        <label><input type="checkbox" id="preferCollection" /> Include one card I own</label>
+        <label><input type="checkbox" id="minimizeWildcards" /> Include one common or uncommon</label>
+      </div>
+      <button type="button" id="analyzeBtn" class="primary">Analyze deck</button>
+    </section>
+
+    <section id="analyzeLoading" class="panel hidden">
+      <h2>Analyzing deck</h2>
+      <p id="loadingMessage" class="muted">Reading decklist…</p>
+      <div id="loadingProgressBar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div id="loadingProgressFill" class="progress-fill"></div>
+      </div>
+      <div id="loadingDeckInfo" class="loading-deck-info hidden">
+        <p><strong>Commander:</strong> <span id="loadingCommander">—</span></p>
+        <p><strong>Color identity:</strong> <span id="loadingColorIdentity">—</span></p>
+        <p id="loadingIllegalHint" class="muted"></p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>MTGA collection (optional)</h2>
+      <input type="file" id="collectionFile" accept=".csv,.txt" />
+      <p id="collectionStatus" class="muted"></p>
+      <details class="export-help">
+        <summary>How to export your collection from MTGA</summary>
+        <ol>
+          <li>Start MTG Arena and open the <strong>Decks</strong> tab. Leave Arena running.</li>
+          <li>Install the <a href="https://github.com/NthPhantom10/MTGA-collection-exporter" target="_blank" rel="noopener">MTGA collection exporter</a> (<code>MTGA_Exporter.exe</code> or <code>python mtg.py</code>). Run as Administrator if needed.</li>
+          <li>On first run, enter at least 3 cards you own with <strong>exact</strong> quantities (5 rares/mythics recommended).</li>
+          <li>Upload <code>mtga_collection_moxfield.csv</code> (or Goldfish/Cardsphere CSV from the same export).</li>
+          <li>If the scan fails: stay on Decks, recheck anchor quantities, try different anchors, or increase <code>--scan-range</code>.</li>
+        </ol>
+      </details>
+    </section>
+
+    <section id="commanderPick" class="panel hidden">
+      <h2>Choose commander</h2>
+      <p>Multiple legendaries detected. Pick your commander:</p>
+      <div id="commanderCandidates" class="card-row"></div>
+    </section>
+
+    <section id="sideboardReview" class="panel hidden">
+      <div class="section-head">
+        <h2>Sideboard review</h2>
+        <button type="button" id="minimizeSideboard">Minimize</button>
+      </div>
+      <div id="sideboardBody">
+        <p class="deck-identity">
+          <strong>Commander:</strong> <span class="identityCommander">—</span>
+          · <strong>Color identity:</strong> <span class="identityColors">—</span>
+        </p>
+        <p id="sideboardSummary" class="muted">
+          Illegal sideboard cards get Arena replacements. Legal sideboard cards and those picks are exported as a new sideboard with the commander and main deck.
+        </p>
+        <div id="sideboardCards" class="card-row"></div>
+        <div id="sideboardReplacementRows"></div>
+      </div>
+    </section>
+
+    <section id="replacements" class="panel hidden">
+      <h2>Replacements</h2>
+      <p class="deck-identity">
+        <strong>Commander:</strong> <span class="identityCommander">—</span>
+        · <strong>Color identity:</strong> <span class="identityColors">—</span>
+      </p>
+      <p id="summary" class="muted"></p>
+      <div id="replacementRows"></div>
+    </section>
+
+    <section id="final" class="panel hidden">
+      <h2>Final Brawl deck</h2>
+      <p id="wildcardSummary" class="muted"></p>
+      <div id="finalGallery" class="gallery"></div>
+      <h3 id="finalSideboardHeading" class="hidden">Sideboard</h3>
+      <div id="finalSideboard" class="gallery"></div>
+      <h3>Arena import</h3>
+      <textarea id="arenaExport" rows="12" readonly></textarea>
+      <button type="button" id="copyExport">Copy to clipboard</button>
+    </section>
+  </main>
+
+  <footer>
+    <p>Card images and data © <a href="https://scryfall.com" target="_blank" rel="noopener">Scryfall</a></p>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
