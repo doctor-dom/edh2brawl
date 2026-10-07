@@ -86,12 +86,13 @@ Deck
 """
     parsed = parse_decklist(text)
     analysis = analyze_deck(idx, parsed, "brawl")
+    slot = next(e.slot for e in analysis.illegal if e.name == "Rhystic Study")
     rows = build_suggestion_payload(
         idx,
         analysis,
         "brawl",
         {},
-        {"Rhystic Study": "Arcane Denial"},
+        {slot: "Arcane Denial"},
         False,
         False,
     )

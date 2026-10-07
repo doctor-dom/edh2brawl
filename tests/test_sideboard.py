@@ -102,7 +102,7 @@ SIDEBOARD
         idx, review, analysis, "brawl", {}, {}, False, False
     )
     assert len(rows) == 1
-    assert rows[0]["slot"] == "sb:Rhystic Study"
+    assert rows[0]["slot"] == "sb:Rhystic Study#0"
     assert rows[0]["zone"] == "sideboard"
     assert len(rows[0]["suggestions"]) >= 1
 
@@ -118,7 +118,7 @@ def test_export_sideboard_uses_selected_replacements():
     ]
     sideboard = build_export_sideboard(
         review,
-        {"sb:Rhystic Study": "Counterspell"},
+        {"sb:Rhystic Study#0": "Counterspell"},
         idx,
     )
     names = [c["name"] for c in sideboard]

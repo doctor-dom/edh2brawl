@@ -17,7 +17,7 @@ Deck
 def test_moxfield_style_qty():
     d = parse_decklist("1x Lightning Bolt\n2x Island")
     assert d.commander_names == ["Island"]
-    assert d.main == ["Lightning Bolt"]
+    assert d.main == ["Lightning Bolt", "Island"]
 
 
 def test_last_line_is_commander_without_section():

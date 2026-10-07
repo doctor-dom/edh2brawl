@@ -10,7 +10,7 @@ Turn a **Commander** decklist into a **100-card Arena Brawl** list by flagging c
 ## Install and run
 
 ```bash
-cd C:\Users\dfili\Projects\edh2brawl
+cd C:/Users/dfili/HUB-projects/edh2brawl
 pip install -e ".[dev]"
 python -m uvicorn app.main:app --reload
 ```

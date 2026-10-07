@@ -64,9 +64,9 @@ def _cards_by_blank_line_blocks(text: str) -> list[list[str]]:
             continue
         if in_sideboard:
             continue
-        card = _parse_line(line)
-        if card:
-            current.append(card)
+        cards = _parse_line_cards(line)
+        if cards:
+            current.extend(cards)
     if current:
         blocks.append(current)
     return blocks
@@ -92,20 +92,26 @@ def _commander_from_blank_line_separation(text: str) -> Optional[tuple[str, list
     return commander, main
 
 
-def _parse_line(line: str) -> Optional[str]:
+def _parse_line_cards(line: str) -> list[str]:
     line = line.strip()
     if not line or line.startswith("//"):
-        return None
+        return []
     if line.startswith("#"):
-        return None
+        return []
     m = LINE_WITH_QTY.match(line)
     if not m:
-        return _clean_card_name(line) if line else None
+        name = _clean_card_name(line) if line else ""
+        return [name] if name else []
     qty = int(m.group(1) or "1")
     name = _clean_card_name(m.group(2))
     if not name or qty < 1:
-        return None
-    return name
+        return []
+    return [name] * qty
+
+
+def _parse_line(line: str) -> Optional[str]:
+    cards = _parse_line_cards(line)
+    return cards[0] if cards else None
 
 
 def parse_decklist(text: str, commander_hint: Optional[str] = None) -> ParsedDeck:
@@ -130,15 +136,15 @@ def parse_decklist(text: str, commander_hint: Optional[str] = None) -> ParsedDec
             section = "sideboard"
             continue
 
-        card = _parse_line(line)
-        if not card:
+        cards = _parse_line_cards(line)
+        if not cards:
             continue
         if section == "commander":
-            result.commander_names.append(card)
+            result.commander_names.extend(cards)
         elif section == "sideboard":
-            result.sideboard.append(card)
+            result.sideboard.extend(cards)
         else:
-            result.main.append(card)
+            result.main.extend(cards)
 
     if commander_hint:
         hint = _clean_card_name(commander_hint)

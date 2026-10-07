@@ -2,12 +2,20 @@ const state = {
   owned: {},
   replacements: {},
   roleOverrides: {},
+  attributeOverrides: {},
+  queryOverrides: {},
   rolls: {},
   cheapOverrides: {},
+  edhrecOverrides: {},
+  poolNamesBySlot: {},
+  edhrecStatus: "unavailable",
   lastAnalysis: null,
+  analysisSnapshot: null,
   colorIdentity: "",
   formatKey: "brawl",
 };
+
+const COMMANDER_SLOT_KEY = "__commander__";
 
 function imageSrc(card) {
   if (card?.image_url) return card.image_url;
@@ -15,6 +23,23 @@ function imageSrc(card) {
     return `https://api.scryfall.com/cards/named?exact=${encodeURIComponent(card.name)}&format=image`;
   }
   return "";
+}
+
+function rarityLetter(rarity) {
+  const r = (rarity || "").toLowerCase();
+  if (r === "mythic" || r === "mythic rare" || r === "mythic-rare") return "M";
+  if (r === "rare") return "R";
+  if (r === "uncommon") return "U";
+  if (r === "common") return "C";
+  return "";
+}
+
+function rarityBadgeClass(rarity) {
+  const r = (rarity || "").toLowerCase();
+  if (r === "mythic" || r === "mythic rare" || r === "mythic-rare") return "badge-rarity-m";
+  if (r === "rare") return "badge-rarity-r";
+  if (r === "uncommon") return "badge-rarity-u";
+  return "badge-rarity-c";
 }
 
 async function fetchStatus() {
@@ -81,11 +106,14 @@ function cardTile(card, onSelect, selectedName, selectable = true) {
     b.className = "badge badge-owned";
     b.textContent = "In collection";
     div.appendChild(b);
-  } else if (card.wildcard_cost) {
-    const b = document.createElement("span");
-    b.className = "badge badge-wc";
-    b.textContent = `${card.wildcard_cost} WC`;
-    div.appendChild(b);
+  } else {
+    const letter = rarityLetter(card.rarity);
+    if (letter) {
+      const b = document.createElement("span");
+      b.className = `badge ${rarityBadgeClass(card.rarity)}`;
+      b.textContent = letter;
+      div.appendChild(b);
+    }
   }
   if (card.reasons?.length) {
     const r = document.createElement("div");
@@ -104,17 +132,119 @@ function cardTile(card, onSelect, selectedName, selectable = true) {
   return div;
 }
 
-function formatSourceAttributes(attrs, activeRole) {
-  if (!attrs) return "";
-  const parts = [];
-  if (attrs.detected_roles?.length) parts.push(`roles: ${attrs.detected_roles.join(", ")}`);
-  if (activeRole) parts.push(`matching as: ${activeRole}`);
-  parts.push(`MV ${attrs.mana_value}`);
-  if (attrs.type_line) parts.push(attrs.type_line);
-  if (attrs.subtypes?.length) parts.push(`tribal: ${attrs.subtypes.join(", ")}`);
-  if (attrs.keywords?.length) parts.push(`keywords: ${attrs.keywords.join(", ")}`);
-  if (attrs.triggers?.length) parts.push(`triggers: ${attrs.triggers.join(", ")}`);
-  return parts.join(" · ");
+function defaultAttributeMap(noticed) {
+  const map = {};
+  for (const attr of noticed || []) {
+    map[attr.id] = attr.group === "score";
+  }
+  return map;
+}
+
+function effectiveAttributeState(slotKey, attr, row) {
+  const overrides = state.attributeOverrides[slotKey];
+  if (overrides && attr.id in overrides) return overrides[attr.id];
+  return attr.group === "score";
+}
+
+function buildAttributePanel(row, slotKey) {
+  const wrap = document.createElement("div");
+  wrap.className = "attribute-panel";
+
+  const scoreLabel = document.createElement("div");
+  scoreLabel.className = "attr-group-label";
+  scoreLabel.textContent = "In the score (toggle off to ignore)";
+  wrap.appendChild(scoreLabel);
+
+  const scoreRow = document.createElement("div");
+  scoreRow.className = "attr-chips";
+  const optionalRow = document.createElement("div");
+  optionalRow.className = "attr-chips";
+  let hasOptional = false;
+
+  for (const attr of row.noticed_attributes || []) {
+    const on = effectiveAttributeState(slotKey, attr, row);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `attr-chip ${on ? "on" : "off"} group-${attr.group}`;
+    const weightPct = Math.round((attr.weight || 0) * 100);
+    btn.title = attr.used
+      ? `Used in ranking (~${weightPct}% weight)`
+      : `Noticed only (~${weightPct}% when on)`;
+    btn.textContent = attr.label;
+    btn.addEventListener("click", () => {
+      const map =
+        state.attributeOverrides[slotKey] ||
+        defaultAttributeMap(row.noticed_attributes);
+      const current = effectiveAttributeState(slotKey, attr, row);
+      map[attr.id] = !current;
+      state.attributeOverrides[slotKey] = map;
+      state.rolls[slotKey] = 0;
+      refreshSlots([slotKey]);
+    });
+    if (attr.group === "score") scoreRow.appendChild(btn);
+    else {
+      hasOptional = true;
+      optionalRow.appendChild(btn);
+    }
+  }
+  wrap.appendChild(scoreRow);
+  if (hasOptional) {
+    const optionalLabel = document.createElement("div");
+    optionalLabel.className = "attr-group-label";
+    optionalLabel.textContent = "Noticed (toggle on to require or emphasize)";
+    wrap.appendChild(optionalLabel);
+    wrap.appendChild(optionalRow);
+  }
+
+  wrap.appendChild(buildScryfallFilter(row, slotKey));
+  appendRerollAndCheapButtons(wrap, slotKey, row);
+  return wrap;
+}
+
+function buildScryfallFilter(row, slotKey) {
+  const wrap = document.createElement("div");
+  wrap.className = "scryfall-filter-wrap";
+  const queryActive = !!(state.queryOverrides[slotKey] || "").trim();
+
+  const status = document.createElement("p");
+  status.className = "filter-status";
+  if (row.query_error) {
+    status.classList.add("query-error");
+    status.textContent = row.query_error;
+  } else if (row.query_matched === 0 && queryActive) {
+    status.classList.add("query-error");
+    status.textContent = "No cards matched this filter.";
+  } else if (queryActive && row.query_matched != null) {
+    status.textContent =
+      row.query_matched === 1 ? "1 match" : `${row.query_matched} matches`;
+  } else {
+    status.classList.add("muted");
+    status.textContent = "";
+  }
+  if (status.textContent) wrap.appendChild(status);
+
+  const details = document.createElement("details");
+  details.className = "scryfall-filter";
+  if (queryActive) details.open = true;
+  const summary = document.createElement("summary");
+  summary.textContent = "Scryfall filter";
+  details.appendChild(summary);
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = 'e.g. t:creature mv<=3 pow>=4 o:trample -o:"enters the battlefield"';
+  input.value = state.queryOverrides[slotKey] || "";
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const q = input.value.trim();
+    if (q) state.queryOverrides[slotKey] = q;
+    else delete state.queryOverrides[slotKey];
+    state.rolls[slotKey] = 0;
+    refreshSlots([slotKey]);
+  });
+  details.appendChild(input);
+  wrap.appendChild(details);
+  return wrap;
 }
 
 function formatColorIdentity(ci) {
@@ -123,7 +253,7 @@ function formatColorIdentity(ci) {
   return [...ci].map((c) => names[c] || c).join(" · ");
 }
 
-function buildAnalyzeBody(commanderOverride, includeSuggestions) {
+function buildAnalyzeBody(commanderOverride) {
   state.formatKey = document.getElementById("formatKey").value;
   return {
     decklist: document.getElementById("decklist").value,
@@ -131,13 +261,223 @@ function buildAnalyzeBody(commanderOverride, includeSuggestions) {
     commander: commanderOverride || document.getElementById("commanderHint").value || null,
     replacements: state.replacements,
     role_overrides: state.roleOverrides,
+    attribute_overrides: state.attributeOverrides,
+    query_overrides: state.queryOverrides,
     rolls: state.rolls,
     cheap_overrides: state.cheapOverrides,
+    edhrec_overrides: state.edhrecOverrides,
+    pool_names_by_slot: {},
     prefer_collection: document.getElementById("preferCollection").checked,
     minimize_wildcards: document.getElementById("minimizeWildcards").checked,
     owned: state.owned,
-    include_suggestions: includeSuggestions,
+    include_suggestions: true,
   };
+}
+
+function buildSlotRefreshBody(slots, mode = "full") {
+  const pool_names_by_slot = {};
+  if (mode === "light") {
+    for (const sk of slots) {
+      const names = state.poolNamesBySlot[sk];
+      if (names?.length) pool_names_by_slot[sk] = names;
+    }
+  }
+  return {
+    snapshot: state.analysisSnapshot,
+    slots,
+    format_key: state.formatKey,
+    replacements: state.replacements,
+    role_overrides: state.roleOverrides,
+    attribute_overrides: state.attributeOverrides,
+    query_overrides: state.queryOverrides,
+    rolls: state.rolls,
+    cheap_overrides: state.cheapOverrides,
+    edhrec_overrides: state.edhrecOverrides,
+    pool_names_by_slot,
+    prefer_collection: document.getElementById("preferCollection").checked,
+    minimize_wildcards: document.getElementById("minimizeWildcards").checked,
+    owned: state.owned,
+  };
+}
+
+function ingestSlotMetaFromRows(rows, resetPools = false) {
+  if (resetPools) state.poolNamesBySlot = {};
+  for (const row of rows || []) {
+    const slot = row.slot;
+    if (!slot) continue;
+    if (row.suggestion_pool_names?.length) {
+      state.poolNamesBySlot[slot] = row.suggestion_pool_names;
+    }
+    if (state.edhrecStatus === "ok" && state.edhrecOverrides[slot] === undefined) {
+      state.edhrecOverrides[slot] = row.prefer_edhrec !== false;
+    }
+  }
+}
+
+function allReplacementRows() {
+  if (!state.lastAnalysis) return [];
+  return [
+    ...(state.lastAnalysis.replacement_rows || []),
+    ...(state.lastAnalysis.sideboard_replacement_rows || []),
+  ];
+}
+
+function findRowBySlot(slotKey) {
+  for (const r of allReplacementRows()) {
+    if (slotKeyForRow(r) === slotKey) return r;
+  }
+  return null;
+}
+
+function applyLocalPick(slotKey, card) {
+  for (const key of ["replacement_rows", "sideboard_replacement_rows"]) {
+    const list = state.lastAnalysis?.[key];
+    if (!list) continue;
+    for (const row of list) {
+      if (slotKeyForRow(row) !== slotKey) continue;
+      row.selected_replacement = { ...card };
+    }
+  }
+}
+
+function replaceReplacementBlock(slotKey) {
+  const row = findRowBySlot(slotKey);
+  if (!row) return;
+  const el = document.querySelector(`.replacement-block[data-slot="${CSS.escape(slotKey)}"]`);
+  if (!el) return;
+  el.replaceWith(renderReplacementBlock(row));
+}
+
+function updateReplacementSummary() {
+  const data = state.lastAnalysis;
+  if (!data) return;
+  const rows = data.replacement_rows || [];
+  const summary = document.getElementById("summary");
+  if (!summary) return;
+  if (!rows.length) {
+    summary.textContent = "";
+    return;
+  }
+  const pending = rows.filter((r) => !state.replacements[slotKeyForRow(r)]).length;
+  summary.textContent = `${rows.length} illegal slot(s), ${pending} still need a pick · deck size ${data.deck_size}/${data.expected_size}`;
+}
+
+function slotsToRefreshOnPick(slotKey, cardName, row) {
+  const refresh = new Set();
+  const linkGroup = row.link_group;
+  for (const r of allReplacementRows()) {
+    const sk = slotKeyForRow(r);
+    if (sk === slotKey || state.replacements[sk]) continue;
+    if (linkGroup && r.link_group === linkGroup) {
+      refresh.add(sk);
+      continue;
+    }
+    if ((r.suggestions || []).some((s) => s.name === cardName)) refresh.add(sk);
+  }
+  return [...refresh];
+}
+
+function pendingSlotKeys() {
+  return allReplacementRows()
+    .map((r) => slotKeyForRow(r))
+    .filter((sk) => !state.replacements[sk]);
+}
+
+function allSlotsFilled() {
+  const rows = allReplacementRows();
+  return rows.length > 0 && rows.every((r) => state.replacements[slotKeyForRow(r)]);
+}
+
+function mergeSlotRows(updatedRows) {
+  if (!state.lastAnalysis) return;
+  const bySlot = new Map(updatedRows.map((r) => [r.slot, r]));
+  for (const key of ["replacement_rows", "sideboard_replacement_rows"]) {
+    const list = state.lastAnalysis[key];
+    if (!list) continue;
+    for (let i = 0; i < list.length; i++) {
+      if (bySlot.has(list[i].slot)) list[i] = bySlot.get(list[i].slot);
+    }
+  }
+}
+
+function setSlotsLoading(slots, loading) {
+  for (const slot of slots) {
+    const el = document.querySelector(`.replacement-block[data-slot="${CSS.escape(slot)}"]`);
+    if (el) el.classList.toggle("slot-loading", loading);
+  }
+}
+
+async function refreshSlots(slots, { partial = false, mode = "full" } = {}) {
+  if (!state.analysisSnapshot || !slots.length) return;
+  if (mode === "full") {
+    for (const sk of slots) delete state.poolNamesBySlot[sk];
+  }
+  setSlotsLoading(slots, true);
+  try {
+    const res = await fetch("/api/suggest/slots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildSlotRefreshBody(slots, mode)),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (data.edhrec) state.edhrecStatus = data.edhrec;
+    const updated = data.rows || [];
+    mergeSlotRows(updated);
+    ingestSlotMetaFromRows(updated);
+    if (partial) {
+      for (const row of updated) replaceReplacementBlock(row.slot);
+      updateReplacementSummary();
+    } else {
+      renderReplacements(state.lastAnalysis);
+      renderSideboard(state.lastAnalysis);
+    }
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    setSlotsLoading(slots, false);
+  }
+}
+
+async function finalizeDeck() {
+  if (!state.analysisSnapshot) return;
+  const res = await fetch("/api/finalize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      snapshot: state.analysisSnapshot,
+      format_key: state.formatKey,
+      replacements: state.replacements,
+      owned: state.owned,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  if (data.pending) {
+    state.lastAnalysis.final_deck = null;
+    document.getElementById("final").classList.add("hidden");
+    return;
+  }
+  state.lastAnalysis.final_deck = data.final_deck;
+  state.lastAnalysis.wildcard_summary = data.wildcard_summary;
+  state.lastAnalysis.arena_export = data.arena_export;
+  renderFinal(state.lastAnalysis);
+}
+
+async function onPickReplacement(slotKey, card, row) {
+  state.replacements[slotKey] = card.name;
+  applyLocalPick(slotKey, card);
+  replaceReplacementBlock(slotKey);
+  updateReplacementSummary();
+  const toRefresh = slotsToRefreshOnPick(slotKey, card.name, row);
+  if (toRefresh.length) await refreshSlots(toRefresh, { partial: true, mode: "full" });
+  if (allSlotsFilled()) {
+    try {
+      await finalizeDeck();
+    } catch (err) {
+      alert(err.message || String(err));
+    }
+  }
 }
 
 function setAnalyzeLoading(active, message, progressPct, indeterminate) {
@@ -194,8 +534,8 @@ async function postAnalyze(body) {
   return res.json();
 }
 
-async function runAnalyze(commanderOverride) {
-  setAnalyzeLoading(true, "Reading decklist…", 8, false);
+async function runFullAnalyze(commanderOverride) {
+  setAnalyzeLoading(true, "Analyzing deck…", 40, true);
   document.getElementById("loadingDeckInfo").classList.add("hidden");
   document.getElementById("commanderPick").classList.add("hidden");
   document.getElementById("replacements").classList.add("hidden");
@@ -204,11 +544,7 @@ async function runAnalyze(commanderOverride) {
 
   let data;
   try {
-    const preview = await postAnalyze(buildAnalyzeBody(commanderOverride, false));
-    setAnalyzeLoading(true, "Finding legal replacements…", 38, false);
-    showLoadingDeckPreview(preview);
-    setAnalyzeLoading(true, "Finding legal replacements…", 38, true);
-    data = await postAnalyze(buildAnalyzeBody(commanderOverride, true));
+    data = await postAnalyze(buildAnalyzeBody(commanderOverride));
     setAnalyzeLoading(true, "Done", 100, false);
   } catch (err) {
     setAnalyzeLoading(false);
@@ -219,7 +555,15 @@ async function runAnalyze(commanderOverride) {
   }
 
   state.lastAnalysis = data;
+  state.analysisSnapshot = data.analysis_snapshot;
   state.colorIdentity = data.color_identity || "";
+  state.edhrecStatus = data.edhrec || "unavailable";
+  state.poolNamesBySlot = {};
+  state.edhrecOverrides = {};
+  ingestSlotMetaFromRows([
+    ...(data.replacement_rows || []),
+    ...(data.sideboard_replacement_rows || []),
+  ]);
 
   const cmdSection = document.getElementById("commanderPick");
   const cmdDiv = document.getElementById("commanderCandidates");
@@ -231,7 +575,7 @@ async function runAnalyze(commanderOverride) {
       btn.textContent = name;
       btn.addEventListener("click", () => {
         document.getElementById("commanderHint").value = name;
-        runAnalyze(name);
+        runFullAnalyze(name);
       });
       cmdDiv.appendChild(btn);
     }
@@ -244,6 +588,8 @@ async function runAnalyze(commanderOverride) {
   showDeckIdentity(data);
   renderFinal(data);
 }
+
+const runAnalyze = runFullAnalyze;
 
 function showDeckIdentity(data) {
   const commander = data.commander || "Unknown";
@@ -287,76 +633,59 @@ function renderSideboard(data) {
 }
 
 function slotKeyForRow(row) {
-  if (row.slot === "commander") return "__commander__";
-  if (typeof row.slot === "string" && row.slot.startsWith("sb:")) return row.slot;
-  return row.illegal_name;
+  if (row.slot === "commander") return COMMANDER_SLOT_KEY;
+  return row.slot || row.illegal_name;
 }
 
-function buildRoleSelect(row, slotKey) {
-  const wrap = document.createElement("div");
-  wrap.className = "role-controls";
-  const label = document.createElement("label");
-  label.textContent = "Major role ";
-  const select = document.createElement("select");
-  const detected = new Set(row.source_attributes?.detected_roles || []);
-  const ordered = [
-    ...(row.source_attributes?.detected_roles || []),
-    ...(row.available_roles || []).filter((r) => !detected.has(r)),
-  ];
-  const blank = document.createElement("option");
-  blank.value = "";
-  blank.textContent = "Auto-detect";
-  select.appendChild(blank);
-  for (const role of ordered) {
-    const opt = document.createElement("option");
-    opt.value = role;
-    opt.textContent = detected.has(role) ? `${role} (detected)` : role;
-    if (row.active_role === role || state.roleOverrides[slotKey] === role) {
-      opt.selected = true;
-    }
-    select.appendChild(opt);
-  }
-  select.addEventListener("change", () => {
-    if (select.value) state.roleOverrides[slotKey] = select.value;
-    else delete state.roleOverrides[slotKey];
-    state.rolls[slotKey] = 0;
-    runAnalyze();
-  });
-  label.appendChild(select);
-  wrap.appendChild(label);
-  appendRerollAndCheapButtons(wrap, slotKey, row.prefer_cheap);
-  return wrap;
-}
-
-function appendRerollAndCheapButtons(wrap, slotKey, preferCheapActive) {
+function appendRerollAndCheapButtons(wrap, slotKey, row) {
   const reroll = document.createElement("button");
   reroll.type = "button";
-  reroll.textContent = "Reroll suggestions";
+  reroll.textContent = "Show next 4";
+  reroll.title = "Cycle through the top 12 ranked replacements (4 at a time)";
   reroll.addEventListener("click", () => {
     state.rolls[slotKey] = (state.rolls[slotKey] || 0) + 1;
-    runAnalyze();
+    refreshSlots([slotKey], { partial: true, mode: "light" });
   });
   wrap.appendChild(reroll);
 
   const cheap = document.createElement("button");
   cheap.type = "button";
   cheap.textContent = "Prefer common/uncommon";
-  if (state.cheapOverrides[slotKey] || preferCheapActive) {
+  if (state.cheapOverrides[slotKey] || row.prefer_cheap) {
     cheap.classList.add("selected");
   }
   cheap.addEventListener("click", () => {
     if (state.cheapOverrides[slotKey]) delete state.cheapOverrides[slotKey];
     else state.cheapOverrides[slotKey] = true;
     state.rolls[slotKey] = 0;
-    runAnalyze();
+    refreshSlots([slotKey], { partial: true, mode: "light" });
   });
   wrap.appendChild(cheap);
+
+  const edhrecWrap = document.createElement("label");
+  edhrecWrap.className = "edhrec-pref";
+  const edhrecCb = document.createElement("input");
+  edhrecCb.type = "checkbox";
+  const edhrecOn =
+    slotKey in state.edhrecOverrides
+      ? state.edhrecOverrides[slotKey]
+      : row.prefer_edhrec !== false;
+  edhrecCb.checked = edhrecOn;
+  edhrecCb.disabled = !(row.edhrec_available || state.edhrecStatus === "ok");
+  edhrecCb.addEventListener("change", () => {
+    state.edhrecOverrides[slotKey] = edhrecCb.checked;
+    state.rolls[slotKey] = 0;
+    refreshSlots([slotKey], { partial: true, mode: "light" });
+  });
+  edhrecWrap.appendChild(edhrecCb);
+  edhrecWrap.append(" Prefer EDHREC");
+  wrap.appendChild(edhrecWrap);
 }
 
 function buildSlotActions(row, slotKey) {
   const wrap = document.createElement("div");
   wrap.className = "role-controls";
-  appendRerollAndCheapButtons(wrap, slotKey, row.prefer_cheap);
+  appendRerollAndCheapButtons(wrap, slotKey, row);
   return wrap;
 }
 
@@ -386,25 +715,28 @@ function renderReplacements(data) {
 
 function renderReplacementBlock(row) {
   const block = document.createElement("div");
+  const slotKey = slotKeyForRow(row);
   block.className = "replacement-block";
+  block.dataset.slot = slotKey;
   const h = document.createElement("h3");
   const zone = row.zone === "sideboard" ? "Sideboard · " : "";
-  h.textContent = zone + row.illegal_name + (row.reason ? ` — ${row.reason}` : "");
+  let title = zone + row.illegal_name + (row.reason ? ` — ${row.reason}` : "");
+  if ((row.linked_count || 1) > 1) {
+    title += ` · copy ${(row.occurrence_index || 0) + 1} of ${row.linked_count}`;
+  }
+  h.textContent = title;
   block.appendChild(h);
+  if ((row.linked_count || 1) > 1) {
+    const linkBadge = document.createElement("p");
+    linkBadge.className = "linked-badge";
+    linkBadge.textContent = "Linked — each copy needs its own legal pick (same card cannot be reused).";
+    block.appendChild(linkBadge);
+  }
 
-    const slotKey = slotKeyForRow(row);
     const selected = state.replacements[slotKey];
 
-    if (row.source_attributes) {
-      const attr = document.createElement("p");
-      attr.className = "muted attrs-line";
-      attr.textContent = formatSourceAttributes(row.source_attributes, row.active_role);
-      block.appendChild(attr);
-      if (row.available_roles?.length) {
-        block.appendChild(buildRoleSelect(row, slotKey));
-      } else {
-        block.appendChild(buildSlotActions(row, slotKey));
-      }
+    if (row.noticed_attributes?.length) {
+      block.appendChild(buildAttributePanel(row, slotKey));
     } else if ((row.suggestions || []).length) {
       block.appendChild(buildSlotActions(row, slotKey));
     }
@@ -451,8 +783,7 @@ function renderReplacementBlock(row) {
         cardTile(
           { ...sug, owned: sug.owned || (state.owned[sug.name] || 0) >= 1 },
           (card) => {
-            state.replacements[slotKey] = card.name;
-            runAnalyze();
+            onPickReplacement(slotKey, card, row);
           },
           selected
         )
@@ -490,7 +821,12 @@ function renderFinal(data) {
   const ws = data.wildcard_summary;
   const el = document.getElementById("wildcardSummary");
   if (ws) {
-    const wc = `common: ${ws.common}, uncommon: ${ws.uncommon}, rare: ${ws.rare}, mythic: ${ws.mythic}`;
+    const parts = [];
+    if (ws.common) parts.push(`${ws.common}C`);
+    if (ws.uncommon) parts.push(`${ws.uncommon}U`);
+    if (ws.rare) parts.push(`${ws.rare}R`);
+    if (ws.mythic) parts.push(`${ws.mythic}M`);
+    const wc = parts.length ? parts.join(", ") : "0";
     if (data.has_collection) {
       el.textContent = `Wildcards to complete deck — ${wc}; already in your collection: ${ws.owned}`;
     } else {
@@ -504,16 +840,20 @@ function renderFinal(data) {
 document.getElementById("analyzeBtn").addEventListener("click", () => {
   state.replacements = {};
   state.roleOverrides = {};
+  state.attributeOverrides = {};
+  state.queryOverrides = {};
   state.rolls = {};
   state.cheapOverrides = {};
-  runAnalyze();
+  state.edhrecOverrides = {};
+  state.poolNamesBySlot = {};
+  runFullAnalyze();
 });
 
 document.getElementById("preferCollection").addEventListener("change", () => {
-  if (state.lastAnalysis) runAnalyze();
+  if (state.analysisSnapshot) refreshSlots(pendingSlotKeys());
 });
 document.getElementById("minimizeWildcards").addEventListener("change", () => {
-  if (state.lastAnalysis) runAnalyze();
+  if (state.analysisSnapshot) refreshSlots(pendingSlotKeys());
 });
 
 document.getElementById("copyExport").addEventListener("click", async () => {

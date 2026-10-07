@@ -64,7 +64,7 @@ def test_singleton_exclude_set():
         "U",
         exclude,
         {},
-    )
+    ).suggestions
     names = [s.card.name for s in sugs]
     assert "Sol Ring" not in names
     assert "Counterspell" not in names
@@ -74,10 +74,10 @@ def test_prefer_collection_reserves_owned_slot():
     idx = _fixture_index()
     source = idx.get("Rhystic Study")
     owned = {"Arcane Denial": 1}
-    baseline = suggest_replacements(idx, source, "brawl", "U", set(), {}, limit=4)
+    baseline = suggest_replacements(idx, source, "brawl", "U", set(), {}, limit=4).suggestions
     sugs_owned = suggest_replacements(
         idx, source, "brawl", "U", set(), owned, prefer_collection=True, minimize_wildcards=False
-    )
+    ).suggestions
     assert sugs_owned[0].card.name == "Arcane Denial"
     assert sugs_owned[0].owned
     assert "in your collection" in sugs_owned[0].reasons
@@ -119,7 +119,7 @@ def test_prefer_collection_skips_unreasonable_owned():
     owned = {"Bad Fit": 4}
     sugs = suggest_replacements(
         idx, source, "brawl", "U", set(), owned, prefer_collection=True, minimize_wildcards=False
-    )
+    ).suggestions
     assert sugs[0].card.name != "Bad Fit"
 
 
@@ -153,10 +153,10 @@ def test_minimize_wildcards_reserves_cheap_option():
     )
     conn.commit()
     source = idx.get("Rhystic Study")
-    baseline = suggest_replacements(idx, source, "brawl", "U", set(), {}, limit=4)
+    baseline = suggest_replacements(idx, source, "brawl", "U", set(), {}, limit=4).suggestions
     cheap = suggest_replacements(
         idx, source, "brawl", "U", set(), {}, prefer_collection=False, minimize_wildcards=True, limit=4
-    )
+    ).suggestions
     assert any(s.card.rarity in ("common", "uncommon") for s in cheap)
     assert any("common or uncommon wildcard" in s.reasons for s in cheap)
     assert cheap[0].card.name == baseline[0].card.name or cheap[0].card.rarity in ("common", "uncommon")
@@ -167,10 +167,10 @@ def test_per_slot_cheap_via_override_equivalent():
     source = idx.get("Rhystic Study")
     global_off = suggest_replacements(
         idx, source, "brawl", "U", set(), {}, prefer_collection=False, minimize_wildcards=False, limit=4
-    )
+    ).suggestions
     slot_on = suggest_replacements(
         idx, source, "brawl", "U", set(), {}, prefer_collection=False, minimize_wildcards=True, limit=4
-    )
+    ).suggestions
     assert not any("common or uncommon wildcard" in s.reasons for s in global_off)
     assert any("common or uncommon wildcard" in s.reasons for s in slot_on)
 
@@ -207,7 +207,7 @@ def test_minimize_wildcards_skips_unreasonable_cheap():
     source = idx.get("Rhystic Study")
     sugs = suggest_replacements(
         idx, source, "brawl", "U", set(), {}, minimize_wildcards=True, limit=4
-    )
+    ).suggestions
     reserved = [s for s in sugs if "common or uncommon wildcard" in s.reasons]
     assert all(s.card.name != "Weak Common" for s in reserved)
 
@@ -286,7 +286,7 @@ def test_role_override_prefers_matching_role():
     source = idx.get("Rhystic Study")
     sugs = suggest_replacements(
         idx, source, "brawl", "U", set(), {}, role_override="counter", limit=SUGGESTIONS_PER_PAGE
-    )
+    ).suggestions
     assert sugs
     names = {s.card.name for s in sugs}
     assert "Counterspell" in names
@@ -316,8 +316,8 @@ def test_reroll_pagination():
         )
     conn.commit()
     source = idx.get("Rhystic Study")
-    page0 = suggest_replacements(idx, source, "brawl", "U", set(), {}, page=0, limit=4)
-    page1 = suggest_replacements(idx, source, "brawl", "U", set(), {}, page=1, limit=4)
+    page0 = suggest_replacements(idx, source, "brawl", "U", set(), {}, page=0, limit=4).suggestions
+    page1 = suggest_replacements(idx, source, "brawl", "U", set(), {}, page=1, limit=4).suggestions
     names0 = {s.card.name for s in page0}
     names1 = {s.card.name for s in page1}
     assert len(page0) == 4
@@ -356,5 +356,5 @@ def test_replacement_excluded_from_other_slot():
     source_a = idx.get("Rhystic Study")
     source_b = idx.get("Cyclonic Rift")
     exclude = {"Arcane Denial"}
-    sugs = suggest_replacements(idx, source_b, "brawl", "U", exclude, {})
+    sugs = suggest_replacements(idx, source_b, "brawl", "U", exclude, {}).suggestions
     assert all(s.card.name != "Arcane Denial" for s in sugs)

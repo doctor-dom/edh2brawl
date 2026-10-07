@@ -15,15 +15,20 @@ from app.cards import get_index
 from app.collection import parse_collection_csv
 from app.deck import parse_decklist
 from app.legality import (
+    COMMANDER_SLOT_KEY,
     analyze_deck,
     analyze_sideboard,
+    build_analysis_snapshot,
     build_export_sideboard,
     build_final_deck,
     build_sideboard_suggestion_rows,
     build_suggestion_payload,
     display_image_url,
+    refresh_suggestion_slots,
     resolve_name,
+    _deck_analysis_from_snapshot,
 )
+from app.edhrec import fetch_commander_synergy
 from app.suggest import suggest_replacements
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -40,10 +45,38 @@ class AnalyzeRequest(BaseModel):
     role_overrides: dict[str, str] = Field(default_factory=dict)
     rolls: dict[str, int] = Field(default_factory=dict)
     cheap_overrides: dict[str, bool] = Field(default_factory=dict)
+    edhrec_overrides: dict[str, bool] = Field(default_factory=dict)
+    pool_names_by_slot: dict[str, list[str]] = Field(default_factory=dict)
+    attribute_overrides: dict[str, dict[str, bool]] = Field(default_factory=dict)
+    query_overrides: dict[str, str] = Field(default_factory=dict)
     prefer_collection: bool = False
     minimize_wildcards: bool = False
     owned: dict[str, int] = Field(default_factory=dict)
     include_suggestions: bool = True
+
+
+class SuggestSlotsRequest(BaseModel):
+    snapshot: dict[str, Any]
+    slots: list[str]
+    format_key: str = Field(default="brawl", pattern="^(brawl|competitivebrawl)$")
+    replacements: dict[str, str] = Field(default_factory=dict)
+    role_overrides: dict[str, str] = Field(default_factory=dict)
+    rolls: dict[str, int] = Field(default_factory=dict)
+    cheap_overrides: dict[str, bool] = Field(default_factory=dict)
+    edhrec_overrides: dict[str, bool] = Field(default_factory=dict)
+    pool_names_by_slot: dict[str, list[str]] = Field(default_factory=dict)
+    attribute_overrides: dict[str, dict[str, bool]] = Field(default_factory=dict)
+    query_overrides: dict[str, str] = Field(default_factory=dict)
+    prefer_collection: bool = False
+    minimize_wildcards: bool = False
+    owned: dict[str, int] = Field(default_factory=dict)
+
+
+class FinalizeRequest(BaseModel):
+    snapshot: dict[str, Any]
+    format_key: str = Field(default="brawl", pattern="^(brawl|competitivebrawl)$")
+    replacements: dict[str, str] = Field(default_factory=dict)
+    owned: dict[str, int] = Field(default_factory=dict)
 
 
 class SearchRequest(BaseModel):
@@ -114,7 +147,7 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
         )
 
     parsed = parse_decklist(body.decklist, commander_hint=body.commander)
-    commander_name = body.replacements.get("__commander__") or body.commander
+    commander_name = body.replacements.get(COMMANDER_SLOT_KEY) or body.commander
     if not commander_name and parsed.commander_names:
         commander_name = parsed.commander_names[0]
 
@@ -125,6 +158,13 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
         body.format_key,
         analysis.color_identity,
     )
+
+    edhrec_map: dict[str, dict[str, float]] = {}
+    edhrec_status = "unavailable"
+    commander_for_edhrec = body.replacements.get(COMMANDER_SLOT_KEY) or analysis.commander_name
+    if commander_for_edhrec:
+        edhrec_map, edhrec_status = fetch_commander_synergy(commander_for_edhrec)
+    edhrec_available = edhrec_status == "ok" and bool(edhrec_map)
 
     rows: list[dict] = []
     sideboard_rows: list[dict] = []
@@ -140,6 +180,12 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
             body.role_overrides,
             body.rolls,
             body.cheap_overrides,
+            body.attribute_overrides,
+            body.query_overrides,
+            edhrec_map,
+            body.edhrec_overrides,
+            body.pool_names_by_slot,
+            edhrec_available,
         )
         sideboard_rows = build_sideboard_suggestion_rows(
             idx,
@@ -153,22 +199,33 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
             body.role_overrides,
             body.rolls,
             body.cheap_overrides,
+            body.attribute_overrides,
+            body.query_overrides,
+            edhrec_map,
+            body.edhrec_overrides,
+            body.pool_names_by_slot,
+            edhrec_available,
         )
 
     pending = []
     for r in rows:
-        if r.get("slot") == "commander":
-            if "__commander__" not in body.replacements:
+        slot = r.get("slot")
+        if slot == COMMANDER_SLOT_KEY:
+            if COMMANDER_SLOT_KEY not in body.replacements:
                 pending.append(r)
-        elif r["illegal_name"] not in body.replacements:
+        elif slot not in body.replacements:
             pending.append(r)
+    for r in sideboard_rows:
+        if r.get("slot") not in body.replacements:
+            pending.append(r)
+
+    snapshot = build_analysis_snapshot(analysis, sideboard_review)
 
     final = None
     wildcard_summary = None
     if not pending:
-        cmd_name = body.replacements.get("__commander__", analysis.commander_name)
-        repl_main = {k: v for k, v in body.replacements.items() if k != "__commander__"}
-        final = build_final_deck(analysis, repl_main, idx, new_commander_name=cmd_name or None)
+        cmd_name = body.replacements.get(COMMANDER_SLOT_KEY, analysis.commander_name)
+        final = build_final_deck(analysis, body.replacements, idx, new_commander_name=cmd_name or None)
         final["sideboard"] = build_export_sideboard(sideboard_review, body.replacements, idx)
         wildcard_summary = _wildcard_summary(final, body.owned, idx)
 
@@ -188,6 +245,64 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
         "sideboard_review": sideboard_review,
         "sideboard_replacement_rows": sideboard_rows,
         "arena_export": _arena_export(final) if final else None,
+        "edhrec": edhrec_status,
+        "analysis_snapshot": snapshot,
+    }
+
+
+@app.post("/api/suggest/slots")
+def suggest_slots(body: SuggestSlotsRequest) -> dict[str, Any]:
+    idx = get_index()
+    if idx.row_count() == 0:
+        raise HTTPException(status_code=503, detail="Card database not ready.")
+    edhrec_map: dict[str, dict[str, float]] = {}
+    edhrec_status = "unavailable"
+    commander_name = body.snapshot.get("commander_name") or body.replacements.get(COMMANDER_SLOT_KEY)
+    if commander_name:
+        edhrec_map, edhrec_status = fetch_commander_synergy(commander_name)
+    edhrec_available = edhrec_status == "ok" and bool(edhrec_map)
+    rows = refresh_suggestion_slots(
+        idx,
+        body.snapshot,
+        body.slots,
+        body.format_key,
+        body.replacements,
+        body.owned,
+        body.prefer_collection,
+        body.minimize_wildcards,
+        body.role_overrides,
+        body.rolls,
+        body.cheap_overrides,
+        body.attribute_overrides,
+        body.query_overrides,
+        edhrec_map,
+        body.edhrec_overrides,
+        body.pool_names_by_slot,
+        edhrec_available,
+    )
+    return {"rows": rows, "edhrec": edhrec_status}
+
+
+@app.post("/api/finalize")
+def finalize_deck(body: FinalizeRequest) -> dict[str, Any]:
+    idx = get_index()
+    analysis = _deck_analysis_from_snapshot(idx, body.snapshot)
+    sideboard_review = body.snapshot.get("sideboard_review") or []
+    from app.legality import _slot_specs_from_snapshot
+
+    all_slots = _slot_specs_from_snapshot(body.snapshot)
+    if any(slot not in body.replacements for slot in all_slots):
+        return {"final_deck": None, "wildcard_summary": None, "arena_export": None, "pending": True}
+
+    cmd_name = body.replacements.get(COMMANDER_SLOT_KEY, analysis.commander_name)
+    final = build_final_deck(analysis, body.replacements, idx, new_commander_name=cmd_name or None)
+    final["sideboard"] = build_export_sideboard(sideboard_review, body.replacements, idx)
+    wildcard_summary = _wildcard_summary(final, body.owned, idx)
+    return {
+        "final_deck": final,
+        "wildcard_summary": wildcard_summary,
+        "arena_export": _arena_export(final),
+        "pending": False,
     }
 
 
@@ -237,7 +352,7 @@ def suggest_one(
         raise HTTPException(status_code=404, detail="Card not found")
     exclude = set(json.loads(exclude_json))
     owned = json.loads(owned_json)
-    sugs = suggest_replacements(
+    run = suggest_replacements(
         idx,
         source,
         format_key,
@@ -249,7 +364,11 @@ def suggest_one(
     )
     from app.legality import _suggestion_json
 
-    return {"suggestions": [_suggestion_json(s) for s in sugs]}
+    return {
+        "suggestions": [_suggestion_json(s) for s in run.suggestions],
+        "query_error": run.query_error,
+        "query_matched": run.query_matched,
+    }
 
 
 def _wildcard_summary(final: dict, owned: dict[str, int], idx) -> dict[str, int]:

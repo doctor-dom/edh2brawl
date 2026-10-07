@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from app.cards import CardIndex, CardRecord
 from app.collection import is_owned
+from app.edhrec import edhrec_score_bonus
+from app.scryfall_filter import ParseError, card_matches, compile_query
 
 REMINDER_RE = re.compile(r"\([^)]*\)")
 WORD_RE = re.compile(r"[a-z0-9']+")
@@ -51,7 +53,7 @@ ROLE_PRIORITY: list[str] = [
 ]
 
 SUGGESTIONS_PER_PAGE = 4
-SUGGESTION_POOL_SIZE = 16
+SUGGESTION_POOL_SIZE = 12
 
 ETB_TRIGGER_RE = re.compile(
     r"enters the battlefield|when (?:this|~|[^\n]{0,40}) enters(?: the battlefield)?",
@@ -115,6 +117,169 @@ def source_attributes(card: CardRecord) -> dict:
         "keywords": [k.strip() for k in card.keywords.split(",") if k.strip()],
         "triggers": [TRIGGER_LABELS[k] for k in sorted(triggers)],
     }
+
+
+def primary_types(type_line: str) -> list[str]:
+    head = (type_line or "").split("—")[0]
+    return [t.strip().lower() for t in head.split() if t.strip()]
+
+
+def noticed_attributes(card: CardRecord) -> list[dict[str, Any]]:
+    """Attributes shown in the UI; defaults match legacy scorer weights."""
+    items: list[dict[str, Any]] = []
+    items.append(
+        {
+            "id": "text:oracle",
+            "group": "score",
+            "label": "Similar rules text",
+            "used": True,
+            "weight": 0.24,
+        }
+    )
+    items.append(
+        {
+            "id": "stat:mana_value",
+            "group": "score",
+            "label": f"Mana value ({card.mana_value:g})",
+            "used": True,
+            "weight": 0.18,
+        }
+    )
+    types = primary_types(card.type_line)
+    type_share = 0.14 / max(1, len(types))
+    for t in types:
+        items.append(
+            {
+                "id": f"type:{t}",
+                "group": "score",
+                "label": f"Type: {t.title()}",
+                "used": True,
+                "weight": round(type_share, 4),
+            }
+        )
+    roles = sorted(detect_roles(card.oracle_text))
+    role_share = 0.28 / max(1, len(roles)) if roles else 0.28
+    for role in roles:
+        items.append(
+            {
+                "id": f"role:{role}",
+                "group": "score",
+                "label": f"Role: {role}",
+                "used": True,
+                "weight": round(role_share, 4),
+            }
+        )
+    triggers = detect_trigger_kinds(card.oracle_text)
+    for trig in sorted(triggers):
+        items.append(
+            {
+                "id": f"trigger:{trig}",
+                "group": "score",
+                "label": f"Trigger: {TRIGGER_LABELS.get(trig, trig)}",
+                "used": True,
+                "weight": 0.07,
+            }
+        )
+    keywords = [k.strip() for k in card.keywords.split(",") if k.strip()]
+    for kw in keywords:
+        items.append(
+            {
+                "id": f"keyword:{kw.lower()}",
+                "group": "optional",
+                "label": f"Keyword: {kw}",
+                "used": False,
+                "weight": 0.03,
+            }
+        )
+    for sub in subtypes_from_type_line(card.type_line):
+        items.append(
+            {
+                "id": f"subtype:{sub.lower()}",
+                "group": "optional",
+                "label": f"Subtype: {sub}",
+                "used": False,
+                "weight": 0.06,
+            }
+        )
+    if card.power is not None:
+        items.append(
+            {
+                "id": "stat:power",
+                "group": "optional",
+                "label": f"Power ({card.power})",
+                "used": False,
+                "weight": 0.12,
+            }
+        )
+    if card.toughness is not None:
+        items.append(
+            {
+                "id": "stat:toughness",
+                "group": "optional",
+                "label": f"Toughness ({card.toughness})",
+                "used": False,
+                "weight": 0.12,
+            }
+        )
+    return items
+
+
+def _attr_enabled(overrides: dict[str, bool], attr_id: str, default: bool) -> bool:
+    if attr_id not in overrides:
+        return default
+    return bool(overrides[attr_id])
+
+
+def _parse_pt(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    v = value.strip()
+    if v in ("*", "X"):
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def _pt_similarity(source: Optional[str], candidate: Optional[str]) -> float:
+    a, b = _parse_pt(source), _parse_pt(candidate)
+    if a is None or b is None:
+        return 0.0
+    dist = abs(a - b)
+    return max(0.0, 1.0 - dist / 6.0)
+
+
+def candidate_matches_attribute_requirements(
+    source: CardRecord,
+    candidate: CardRecord,
+    overrides: dict[str, bool],
+) -> bool:
+    for trig in detect_trigger_kinds(source.oracle_text):
+        key = f"trigger:{trig}"
+        if not _attr_enabled(overrides, key, True) and trig in detect_trigger_kinds(candidate.oracle_text):
+            return False
+    for kw in [k.strip().lower() for k in source.keywords.split(",") if k.strip()]:
+        key = f"keyword:{kw}"
+        if _attr_enabled(overrides, key, False):
+            cand_kw = {k.strip().lower() for k in candidate.keywords.split(",") if k.strip()}
+            if kw not in cand_kw:
+                return False
+    for sub in [s.lower() for s in subtypes_from_type_line(source.type_line)]:
+        key = f"subtype:{sub}"
+        if _attr_enabled(overrides, key, False):
+            cand_sub = {s.lower() for s in subtypes_from_type_line(candidate.type_line)}
+            if sub not in cand_sub:
+                return False
+    return True
+
+
+def _type_overlap_enabled(source_line: str, cand_line: str, overrides: dict[str, bool]) -> float:
+    src_types = {t for t in primary_types(source_line) if _attr_enabled(overrides, f"type:{t}", True)}
+    cand_types = {t.strip().lower() for t in cand_line.split("—")[0].split() if t.strip()}
+    if not src_types or not cand_types:
+        return 0.0
+    return len(src_types & cand_types) / len(src_types | cand_types)
 
 
 def tokenize_oracle(text: str) -> set[str]:
@@ -186,63 +351,173 @@ class ScoredSuggestion:
     wildcard_cost: int
 
 
+@dataclass
+class SuggestionRunResult:
+    suggestions: list[ScoredSuggestion]
+    query_error: Optional[str] = None
+    query_matched: Optional[int] = None
+    pool_names: list[str] = field(default_factory=list)
+    pool_refresh: str = "full"
+
+
+def _apply_edhrec_bonus(
+    score: float,
+    reasons: list[str],
+    card_name: str,
+    edhrec_map: Optional[dict[str, dict[str, float]]],
+) -> tuple[float, list[str]]:
+    if not edhrec_map:
+        return score, reasons
+    bonus, label = edhrec_score_bonus(card_name, edhrec_map)
+    if bonus <= 0 or not label:
+        return score, reasons
+    out_reasons = list(reasons)
+    out_reasons.insert(0, label)
+    return score + bonus, out_reasons
+
+
 def score_replacement(
     source: CardRecord,
     candidate: CardRecord,
     owned: dict[str, int],
     active_role: Optional[str] = None,
+    attribute_overrides: Optional[dict[str, bool]] = None,
+    edhrec_map: Optional[dict[str, dict[str, float]]] = None,
 ) -> ScoredSuggestion:
     src_roles = detect_roles(source.oracle_text)
     cand_roles = detect_roles(candidate.oracle_text)
-    role_score = 0.0
-    if active_role:
-        role_score = 1.0 if active_role in cand_roles else 0.0
-    elif src_roles:
-        role_score = len(src_roles & cand_roles) / len(src_roles)
-    elif cand_roles:
-        role_score = 0.15
-
-    oracle_sim = jaccard(tokenize_oracle(source.oracle_text), tokenize_oracle(candidate.oracle_text))
-    cmc_dist = abs(source.mana_value - candidate.mana_value)
-    cmc_score = max(0.0, 1.0 - cmc_dist / 6.0)
-    type_score = type_overlap(source.type_line, candidate.type_line)
-    sub_score = subtype_overlap(source.type_line, candidate.type_line)
-    kw_score = keyword_overlap(source.keywords, candidate.keywords)
     src_triggers = detect_trigger_kinds(source.oracle_text)
     cand_triggers = detect_trigger_kinds(candidate.oracle_text)
-    trigger_score = 1.0 if src_triggers & cand_triggers else 0.0
 
-    score = (
-        0.28 * role_score
-        + 0.24 * oracle_sim
-        + 0.18 * cmc_score
-        + 0.14 * type_score
-        + 0.06 * sub_score
-        + 0.03 * kw_score
-        + 0.07 * trigger_score
-    )
+    if attribute_overrides is not None:
+        overrides = attribute_overrides
+        enabled_src_roles = {
+            r for r in src_roles if _attr_enabled(overrides, f"role:{r}", True)
+        }
+        role_score = 0.0
+        if enabled_src_roles:
+            role_score = len(enabled_src_roles & cand_roles) / len(enabled_src_roles)
 
-    reasons: list[str] = []
-    if active_role and active_role in cand_roles:
-        reasons.append(f"matches role: {active_role}")
-    elif src_roles & cand_roles:
-        reasons.append(f"shared role: {', '.join(sorted(src_roles & cand_roles))}")
-    if cmc_score > 0.85:
-        reasons.append("similar mana value")
-    elif cmc_score > 0.5:
-        reasons.append("close mana value")
-    if oracle_sim > 0.2:
-        reasons.append("similar oracle text")
-    if type_score > 0.4:
-        reasons.append("similar card type")
-    if sub_score > 0.3:
-        reasons.append("shared subtypes (tribal)")
-    if "etb" in src_triggers & cand_triggers:
-        reasons.append("shared enters-the-battlefield trigger")
-    if "attack" in src_triggers & cand_triggers:
-        reasons.append("shared attack trigger")
-    if not reasons:
-        reasons.append("general functional fit")
+        oracle_sim = (
+            jaccard(tokenize_oracle(source.oracle_text), tokenize_oracle(candidate.oracle_text))
+            if _attr_enabled(overrides, "text:oracle", True)
+            else 0.0
+        )
+        cmc_score = 0.0
+        if _attr_enabled(overrides, "stat:mana_value", True):
+            cmc_dist = abs(source.mana_value - candidate.mana_value)
+            cmc_score = max(0.0, 1.0 - cmc_dist / 6.0)
+        type_score = _type_overlap_enabled(source.type_line, candidate.type_line, overrides)
+        sub_score = (
+            subtype_overlap(source.type_line, candidate.type_line)
+            if any(
+                _attr_enabled(overrides, f"subtype:{s.lower()}", False)
+                for s in subtypes_from_type_line(source.type_line)
+            )
+            else 0.0
+        )
+        kw_score = 0.0
+        if any(
+            _attr_enabled(overrides, f"keyword:{k.lower()}", False)
+            for k in source.keywords.split(",")
+            if k.strip()
+        ):
+            kw_score = keyword_overlap(source.keywords, candidate.keywords)
+        trigger_score = 0.0
+        if src_triggers & cand_triggers:
+            shared = src_triggers & cand_triggers
+            if all(_attr_enabled(overrides, f"trigger:{t}", True) for t in shared):
+                trigger_score = 1.0
+
+        score = (
+            0.28 * role_score
+            + 0.24 * oracle_sim
+            + 0.18 * cmc_score
+            + 0.14 * type_score
+            + 0.06 * sub_score
+            + 0.03 * kw_score
+            + 0.07 * trigger_score
+        )
+        if _attr_enabled(overrides, "stat:power", False):
+            score += 0.12 * _pt_similarity(source.power, candidate.power)
+        if _attr_enabled(overrides, "stat:toughness", False):
+            score += 0.12 * _pt_similarity(source.toughness, candidate.toughness)
+
+        reasons: list[str] = []
+        if enabled_src_roles & cand_roles:
+            reasons.append(f"shared role: {', '.join(sorted(enabled_src_roles & cand_roles))}")
+        if cmc_score > 0.85:
+            reasons.append("similar mana value")
+        elif cmc_score > 0.5:
+            reasons.append("close mana value")
+        if oracle_sim > 0.2:
+            reasons.append("similar oracle text")
+        if type_score > 0.4:
+            reasons.append("similar card type")
+        if sub_score > 0.3:
+            reasons.append("shared subtypes (tribal)")
+        if trigger_score > 0 and "etb" in src_triggers & cand_triggers:
+            reasons.append("shared enters-the-battlefield trigger")
+        if trigger_score > 0 and "attack" in src_triggers & cand_triggers:
+            reasons.append("shared attack trigger")
+        if _attr_enabled(overrides, "stat:power", False) and _pt_similarity(source.power, candidate.power) > 0.5:
+            reasons.append("similar power")
+        if _attr_enabled(overrides, "stat:toughness", False) and _pt_similarity(
+            source.toughness, candidate.toughness
+        ) > 0.5:
+            reasons.append("similar toughness")
+        if not reasons:
+            reasons.append("general functional fit")
+    else:
+        role_score = 0.0
+        if active_role:
+            role_score = 1.0 if active_role in cand_roles else 0.0
+        elif src_roles:
+            role_score = len(src_roles & cand_roles) / len(src_roles)
+        elif cand_roles:
+            role_score = 0.15
+
+        oracle_sim = jaccard(tokenize_oracle(source.oracle_text), tokenize_oracle(candidate.oracle_text))
+        cmc_dist = abs(source.mana_value - candidate.mana_value)
+        cmc_score = max(0.0, 1.0 - cmc_dist / 6.0)
+        type_score = type_overlap(source.type_line, candidate.type_line)
+        sub_score = subtype_overlap(source.type_line, candidate.type_line)
+        kw_score = keyword_overlap(source.keywords, candidate.keywords)
+        trigger_score = 1.0 if src_triggers & cand_triggers else 0.0
+
+        score = (
+            0.28 * role_score
+            + 0.24 * oracle_sim
+            + 0.18 * cmc_score
+            + 0.14 * type_score
+            + 0.06 * sub_score
+            + 0.03 * kw_score
+            + 0.07 * trigger_score
+        )
+
+        reasons: list[str] = []
+        if active_role and active_role in cand_roles:
+            reasons.append(f"matches role: {active_role}")
+        elif src_roles & cand_roles:
+            reasons.append(f"shared role: {', '.join(sorted(src_roles & cand_roles))}")
+        if cmc_score > 0.85:
+            reasons.append("similar mana value")
+        elif cmc_score > 0.5:
+            reasons.append("close mana value")
+        if oracle_sim > 0.2:
+            reasons.append("similar oracle text")
+        if type_score > 0.4:
+            reasons.append("similar card type")
+        if sub_score > 0.3:
+            reasons.append("shared subtypes (tribal)")
+        if "etb" in src_triggers & cand_triggers:
+            reasons.append("shared enters-the-battlefield trigger")
+        if "attack" in src_triggers & cand_triggers:
+            reasons.append("shared attack trigger")
+        if not reasons:
+            reasons.append("general functional fit")
+
+    score, reasons = _apply_edhrec_bonus(score, reasons, candidate.name, edhrec_map)
 
     return ScoredSuggestion(
         card=candidate,
@@ -301,18 +576,24 @@ def _assemble_suggestion_page(
     minimize_wildcards: bool,
     page: int,
     limit: int,
+    skip_reasonable_check: bool = False,
 ) -> list[ScoredSuggestion]:
     scored.sort(key=lambda x: -x.score)
     best_score = scored[0].score
     reserved: list[ScoredSuggestion] = []
     reserved_names: set[str] = set()
 
+    def reasonable(s: ScoredSuggestion, ref: float) -> bool:
+        if skip_reasonable_check:
+            return True
+        return is_reasonable_replacement(source, s, ref)
+
     if prefer_collection and owned:
         owned_scored = [s for s in scored if s.owned]
         if owned_scored:
             owned_ref = max(s.score for s in owned_scored)
             owned_candidates = [
-                s for s in owned_scored if is_reasonable_replacement(source, s, owned_ref)
+                s for s in owned_scored if reasonable(s, owned_ref)
             ]
             owned_candidates.sort(key=lambda x: -x.score)
             if owned_candidates:
@@ -327,7 +608,7 @@ def _assemble_suggestion_page(
         if cheap_scored:
             cheap_ref = max(s.score for s in cheap_scored)
             cheap_candidates = [
-                s for s in cheap_scored if is_reasonable_replacement(source, s, cheap_ref)
+                s for s in cheap_scored if reasonable(s, cheap_ref)
             ]
             cheap_candidates.sort(key=lambda s: (-s.score, s.wildcard_cost))
             if cheap_candidates:
@@ -346,6 +627,90 @@ def _assemble_suggestion_page(
     return reserved + remainder[start : start + slots]
 
 
+def rescore_pool_by_names(
+    index: CardIndex,
+    source: CardRecord,
+    names: list[str],
+    owned: dict[str, int],
+    active_role: Optional[str] = None,
+    attribute_overrides: Optional[dict[str, bool]] = None,
+    edhrec_map: Optional[dict[str, dict[str, float]]] = None,
+) -> list[ScoredSuggestion]:
+    scored: list[ScoredSuggestion] = []
+    for name in names:
+        cand = index.get(name)
+        if not cand or cand.name == source.name:
+            continue
+        scored.append(
+            score_replacement(
+                source,
+                cand,
+                owned,
+                active_role=active_role,
+                attribute_overrides=attribute_overrides,
+                edhrec_map=edhrec_map,
+            )
+        )
+    scored.sort(key=lambda x: -x.score)
+    return scored
+
+
+def suggest_from_pool(
+    index: CardIndex,
+    source: CardRecord,
+    pool_names: list[str],
+    owned: dict[str, int],
+    prefer_collection: bool,
+    minimize_wildcards: bool,
+    page: int = 0,
+    limit: int = SUGGESTIONS_PER_PAGE,
+    role_override: Optional[str] = None,
+    attribute_overrides: Optional[dict[str, bool]] = None,
+    edhrec_map: Optional[dict[str, dict[str, float]]] = None,
+) -> SuggestionRunResult:
+    use_attributes = attribute_overrides is not None
+    active_role = None if use_attributes else (role_override or None)
+    scored = rescore_pool_by_names(
+        index,
+        source,
+        pool_names,
+        owned,
+        active_role=active_role,
+        attribute_overrides=attribute_overrides,
+        edhrec_map=edhrec_map,
+    )
+    if not scored:
+        return SuggestionRunResult(suggestions=[], pool_names=[], pool_refresh="light")
+    pool_out = [s.card.name for s in scored]
+    suggestions = _assemble_suggestion_page(
+        source,
+        scored,
+        owned,
+        prefer_collection,
+        minimize_wildcards,
+        page,
+        limit,
+        skip_reasonable_check=False,
+    )
+    return SuggestionRunResult(
+        suggestions=suggestions,
+        pool_names=pool_out,
+        pool_refresh="light",
+    )
+
+
+def edhrec_map_for_slot(
+    edhrec_map: Optional[dict[str, dict[str, float]]],
+    edhrec_overrides: dict[str, bool],
+    slot: str,
+) -> Optional[dict[str, dict[str, float]]]:
+    if not edhrec_map:
+        return None
+    if not edhrec_overrides.get(slot, True):
+        return None
+    return edhrec_map
+
+
 def suggest_replacements(
     index: CardIndex,
     source: CardRecord,
@@ -359,9 +724,26 @@ def suggest_replacements(
     page: int = 0,
     limit: int = SUGGESTIONS_PER_PAGE,
     pool_size: int = SUGGESTION_POOL_SIZE,
-) -> list[ScoredSuggestion]:
-    active_role = role_override or default_major_role(source)
+    attribute_overrides: Optional[dict[str, bool]] = None,
+    scryfall_query: Optional[str] = None,
+    edhrec_map: Optional[dict[str, dict[str, float]]] = None,
+) -> SuggestionRunResult:
+    """Pipeline: Brawl-legal candidates → attribute filters → Scryfall match → score → sort → page."""
+    query_ast: Any = None
+    query_error: Optional[str] = None
+    if scryfall_query and scryfall_query.strip():
+        try:
+            query_ast = compile_query(scryfall_query.strip())
+        except ParseError as exc:
+            return SuggestionRunResult(
+                suggestions=[], query_error=str(exc), query_matched=0, pool_names=[], pool_refresh="full"
+            )
+
+    use_attributes = attribute_overrides is not None
+    active_role = None if use_attributes else (role_override or None)
+
     scored: list[ScoredSuggestion] = []
+    matched_count = 0
     for cand in index.iter_candidates(format_key, commander_ci, exclude):
         if cand.name == source.name:
             continue
@@ -369,23 +751,36 @@ def suggest_replacements(
             continue
         if source.is_brawler and not cand.is_brawler:
             continue
-        if role_override and active_role and active_role not in detect_roles(cand.oracle_text):
+        if not use_attributes and role_override and role_override not in detect_roles(cand.oracle_text):
             continue
+        if use_attributes and not candidate_matches_attribute_requirements(source, cand, attribute_overrides or {}):
+            continue
+        if query_ast and not card_matches(cand, query_ast):
+            continue
+        matched_count += 1
         scored.append(
             score_replacement(
                 source,
                 cand,
                 owned,
-                active_role=role_override or None,
+                active_role=active_role,
+                attribute_overrides=attribute_overrides if use_attributes else None,
+                edhrec_map=edhrec_map,
             )
         )
 
     if not scored:
-        return []
+        return SuggestionRunResult(
+            suggestions=[],
+            query_matched=matched_count if query_ast else None,
+            pool_names=[],
+            pool_refresh="full",
+        )
 
     scored.sort(key=lambda x: -x.score)
+    pool_names = [s.card.name for s in scored[:pool_size]]
     scored = scored[:pool_size]
-    return _assemble_suggestion_page(
+    suggestions = _assemble_suggestion_page(
         source,
         scored,
         owned,
@@ -393,6 +788,13 @@ def suggest_replacements(
         minimize_wildcards,
         page,
         limit,
+        skip_reasonable_check=bool(query_ast),
+    )
+    return SuggestionRunResult(
+        suggestions=suggestions,
+        query_matched=matched_count if query_ast else None,
+        pool_names=pool_names,
+        pool_refresh="full",
     )
 
 
