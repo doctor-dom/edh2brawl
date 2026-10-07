@@ -20,6 +20,8 @@ from app.legality import (
     analyze_sideboard,
     build_analysis_snapshot,
     build_export_sideboard,
+    build_partial_deck,
+    pending_replacement_slots,
     build_final_deck,
     build_sideboard_suggestion_rows,
     build_suggestion_payload,
@@ -283,6 +285,27 @@ def suggest_slots(body: SuggestSlotsRequest) -> dict[str, Any]:
     return {"rows": rows, "edhrec": edhrec_status}
 
 
+class PartialExportRequest(BaseModel):
+    snapshot: dict[str, Any]
+    format_key: str = Field(default="brawl", pattern="^(brawl|competitivebrawl)$")
+    replacements: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/api/export/partial")
+def export_partial(body: PartialExportRequest) -> dict[str, Any]:
+    idx = get_index()
+    analysis = _deck_analysis_from_snapshot(idx, body.snapshot)
+    sideboard_review = body.snapshot.get("sideboard_review") or []
+    partial = build_partial_deck(analysis, body.replacements, idx, sideboard_review)
+    pending = pending_replacement_slots(body.snapshot, body.replacements)
+    return {
+        "partial_deck": partial,
+        "arena_export": _arena_export(partial, pending_slots=pending),
+        "pending_slots": pending,
+        "pending_count": len(pending),
+    }
+
+
 @app.post("/api/finalize")
 def finalize_deck(body: FinalizeRequest) -> dict[str, Any]:
     idx = get_index()
@@ -398,7 +421,7 @@ def _wildcard_summary(final: dict, owned: dict[str, int], idx) -> dict[str, int]
     return counts
 
 
-def _arena_export(final: dict) -> str:
+def _arena_export(final: dict, pending_slots: list[str] | None = None) -> str:
     lines: list[str] = []
     if final.get("commander"):
         lines.append("Commander")
@@ -413,4 +436,9 @@ def _arena_export(final: dict) -> str:
         lines.append("Sideboard")
         for c in sideboard:
             lines.append(f"1 {c['name']}")
+    if pending_slots:
+        lines.append("")
+        lines.append(f"# Incomplete: {len(pending_slots)} slot(s) still need an Arena replacement.")
+        for slot in pending_slots:
+            lines.append(f"#   {slot}")
     return "\n".join(lines)

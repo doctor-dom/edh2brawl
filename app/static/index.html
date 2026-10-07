@@ -37,6 +37,13 @@
       <button type="button" id="analyzeBtn" class="primary">Analyze deck</button>
     </section>
 
+    <section id="deckPartialExportBlock" class="panel partial-export hidden">
+      <h2>Working Brawl list</h2>
+      <p id="deckPartialExportHint" class="muted">Updates as you pick replacements. Unpicked illegal cards stay listed; remove # comment lines before Arena import.</p>
+      <textarea id="deckPartialExport" rows="14" readonly></textarea>
+      <button type="button" id="copyDeckPartialExport">Copy working decklist</button>
+    </section>
+
     <section id="analyzeLoading" class="panel hidden">
       <h2>Analyzing deck</h2>
       <p id="loadingMessage" class="muted">Reading decklist…</p>
@@ -97,6 +104,12 @@
         · <strong>Color identity:</strong> <span class="identityColors">—</span>
       </p>
       <p id="summary" class="muted"></p>
+      <div id="partialExportBlock" class="partial-export hidden">
+        <h3>Partial deck export</h3>
+        <p id="partialExportHint" class="muted">Picks applied; unpicked illegal cards stay in the list. Lines starting with # are notes (remove before Arena import).</p>
+        <textarea id="partialExport" rows="14" readonly></textarea>
+        <button type="button" id="copyPartialExport">Copy partial decklist</button>
+      </div>
       <div id="replacementRows"></div>
     </section>
 

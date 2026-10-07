@@ -1001,6 +1001,77 @@ def _suggestion_json(s) -> dict:
     }
 
 
+def build_partial_deck(
+    analysis: DeckAnalysis,
+    replacements: dict[str, str],
+    index: CardIndex,
+    sideboard_review: list[dict],
+) -> dict:
+    """Apply chosen replacements; unpicked illegal slots keep the original illegal card."""
+    commander_name = replacements.get(COMMANDER_SLOT_KEY) or analysis.commander_name
+    commander = resolve_name(index, commander_name) if commander_name else None
+
+    main_cards: list[CardRecord] = list(analysis.legal_main)
+    for entry in analysis.illegal:
+        if entry.is_commander:
+            continue
+        slot = entry.slot or entry.name
+        if slot in replacements:
+            rec = resolve_name(index, replacements[slot])
+            if rec:
+                main_cards.append(rec)
+                continue
+        if entry.card:
+            main_cards.append(entry.card)
+
+    deck_list = main_cards
+    if commander:
+        deck_list = [c for c in main_cards if c.name != commander.name]
+
+    sideboard = build_partial_export_sideboard(sideboard_review, replacements, index)
+
+    return {
+        "commander": _card_json(commander) if commander else None,
+        "main": [_card_json(c) for c in deck_list],
+        "sideboard": sideboard,
+        "count": (1 if commander else 0) + len(deck_list) + len(sideboard),
+        "replaced": dict(replacements),
+    }
+
+
+def build_partial_export_sideboard(
+    sideboard_review: list[dict],
+    replacements: dict[str, str],
+    index: CardIndex,
+) -> list[dict]:
+    out: list[dict] = []
+    sb_occ: dict[str, int] = defaultdict(int)
+    for entry in sideboard_review:
+        name = entry["name"]
+        if entry.get("status") == "legal":
+            rec = resolve_name(index, name)
+            card = _card_json(rec) if rec else entry.get("card")
+        else:
+            occ = sb_occ[name]
+            sb_occ[name] += 1
+            slot = sideboard_slot_key(name, occ)
+            picked = replacements.get(slot)
+            if picked:
+                rec = resolve_name(index, picked)
+                card = _card_json(rec) if rec else None
+            else:
+                rec = resolve_name(index, name)
+                card = _card_json(rec) if rec else entry.get("card")
+        if card:
+            out.append(card)
+    return out
+
+
+def pending_replacement_slots(snapshot: dict[str, Any], replacements: dict[str, str]) -> list[str]:
+    specs = _slot_specs_from_snapshot(snapshot)
+    return sorted(slot for slot in specs if slot not in replacements)
+
+
 def build_final_deck(
     analysis: DeckAnalysis,
     replacements: dict[str, str],

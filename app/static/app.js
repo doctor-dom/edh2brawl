@@ -439,6 +439,45 @@ async function refreshSlots(slots, { partial = false, mode = "full" } = {}) {
   }
 }
 
+function setPartialExportUi(exportText, hintText) {
+  for (const id of ["partialExport", "deckPartialExport"]) {
+    const el = document.getElementById(id);
+    if (el) el.value = exportText;
+  }
+  for (const id of ["partialExportHint", "deckPartialExportHint"]) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = hintText;
+  }
+  for (const id of ["partialExportBlock", "deckPartialExportBlock"]) {
+    document.getElementById(id)?.classList.remove("hidden");
+  }
+}
+
+async function refreshPartialExport() {
+  if (!state.analysisSnapshot) return;
+  try {
+    const res = await fetch("/api/export/partial", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        snapshot: state.analysisSnapshot,
+        format_key: state.formatKey,
+        replacements: state.replacements,
+      }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const n = data.pending_count || 0;
+    const hint =
+      n === 0
+        ? "All replacement slots filled — use Final Brawl deck below for the clean Arena import."
+        : `${n} slot(s) still need a pick. Picks applied; unpicked illegal cards remain in the list. Remove # comment lines before Arena import.`;
+    setPartialExportUi(data.arena_export || "", hint);
+  } catch (err) {
+    setPartialExportUi("", `Could not build partial export: ${err.message || err}`);
+  }
+}
+
 async function finalizeDeck() {
   if (!state.analysisSnapshot) return;
   const res = await fetch("/api/finalize", {
@@ -469,6 +508,7 @@ async function onPickReplacement(slotKey, card, row) {
   applyLocalPick(slotKey, card);
   replaceReplacementBlock(slotKey);
   updateReplacementSummary();
+  refreshPartialExport();
   const toRefresh = slotsToRefreshOnPick(slotKey, card.name, row);
   if (toRefresh.length) await refreshSlots(toRefresh, { partial: true, mode: "full" });
   if (allSlotsFilled()) {
@@ -541,6 +581,8 @@ async function runFullAnalyze(commanderOverride) {
   document.getElementById("replacements").classList.add("hidden");
   document.getElementById("final").classList.add("hidden");
   document.getElementById("sideboardReview").classList.add("hidden");
+  document.getElementById("deckPartialExportBlock")?.classList.add("hidden");
+  document.getElementById("partialExportBlock")?.classList.add("hidden");
 
   let data;
   try {
@@ -587,6 +629,7 @@ async function runFullAnalyze(commanderOverride) {
   renderSideboard(data);
   showDeckIdentity(data);
   renderFinal(data);
+  refreshPartialExport();
 }
 
 const runAnalyze = runFullAnalyze;
@@ -858,6 +901,16 @@ document.getElementById("minimizeWildcards").addEventListener("change", () => {
 
 document.getElementById("copyExport").addEventListener("click", async () => {
   const t = document.getElementById("arenaExport").value;
+  await navigator.clipboard.writeText(t);
+});
+
+document.getElementById("copyPartialExport").addEventListener("click", async () => {
+  const t = document.getElementById("partialExport").value;
+  await navigator.clipboard.writeText(t);
+});
+
+document.getElementById("copyDeckPartialExport").addEventListener("click", async () => {
+  const t = document.getElementById("deckPartialExport").value;
   await navigator.clipboard.writeText(t);
 });
 
