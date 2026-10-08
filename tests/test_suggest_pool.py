@@ -8,6 +8,7 @@ from app.deck import parse_decklist
 from app.legality import analyze_deck
 from app.suggest import (
     SUGGESTION_POOL_SIZE,
+    apply_external_ranking,
     edhrec_map_for_slot,
     score_replacement,
     suggest_from_pool,
@@ -135,9 +136,10 @@ def test_edhrec_map_for_slot_and_scoring():
     b = idx.get("Plain Instant")
     base_a = score_replacement(source, a, {})
     base_b = score_replacement(source, b, {})
-    boosted_a = score_replacement(source, a, {}, edhrec_map=edhrec)
+    boosted_a = apply_external_ranking(base_a, edhrec, None)
+    boosted_b = apply_external_ranking(base_b, edhrec, None)
     assert boosted_a.score > base_a.score
-    assert boosted_a.score >= base_b.score or boosted_a.score > score_replacement(source, b, {}, edhrec_map=edhrec).score - 0.001
+    assert boosted_a.score > boosted_b.score
 
 
 def test_light_refresh_skips_iter_candidates():

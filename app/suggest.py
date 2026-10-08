@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 from app.cards import CardIndex, CardRecord
 from app.collection import is_owned
-from app.edhrec import edhrec_score_bonus
 from app.scryfall_filter import ParseError, card_matches, compile_query
 
 REMINDER_RE = re.compile(r"\([^)]*\)")
@@ -52,8 +51,12 @@ ROLE_PRIORITY: list[str] = [
     "mill",
 ]
 
-SUGGESTIONS_PER_PAGE = 4
-SUGGESTION_POOL_SIZE = 12
+SUGGESTIONS_PER_PAGE = 5
+SUGGESTION_POOL_SIZE = 20
+
+WEIGHT_INTERNAL = 0.5
+WEIGHT_EDHREC = 0.25
+WEIGHT_DECKCHECK = 0.25
 
 ETB_TRIGGER_RE = re.compile(
     r"enters the battlefield|when (?:this|~|[^\n]{0,40}) enters(?: the battlefield)?",
@@ -360,20 +363,81 @@ class SuggestionRunResult:
     pool_refresh: str = "full"
 
 
-def _apply_edhrec_bonus(
-    score: float,
-    reasons: list[str],
+def edhrec_signal(card_name: str, edhrec_map: dict[str, dict[str, float]]) -> tuple[float, Optional[str]]:
+    entry = edhrec_map.get(card_name)
+    if not entry:
+        return 0.0, None
+    synergy = entry.get("synergy") or 0.0
+    if synergy > 0:
+        return min(1.0, float(synergy) / 40.0), f"EDHREC synergy ({synergy:.0f})"
+    inclusion = entry.get("inclusion") or 0.0
+    if inclusion > 0:
+        return min(1.0, float(inclusion)), f"EDHREC staple ({inclusion * 100:.0f}% decks)"
+    return 0.0, None
+
+
+def deckcheck_signal(card_name: str, deckcheck_map: dict[str, float]) -> tuple[float, Optional[str]]:
+    rate = deckcheck_map.get(card_name)
+    if not rate or rate <= 0:
+        return 0.0, None
+    pct = int(round(float(rate) * 100))
+    return min(1.0, float(rate)), f"DeckCheck ({pct}% of sampled decks)"
+
+
+def blend_replacement_score(
+    internal: float,
     card_name: str,
     edhrec_map: Optional[dict[str, dict[str, float]]],
+    deckcheck_map: Optional[dict[str, float]],
 ) -> tuple[float, list[str]]:
-    if not edhrec_map:
-        return score, reasons
-    bonus, label = edhrec_score_bonus(card_name, edhrec_map)
-    if bonus <= 0 or not label:
-        return score, reasons
-    out_reasons = list(reasons)
-    out_reasons.insert(0, label)
-    return score + bonus, out_reasons
+    weights: list[float] = [WEIGHT_INTERNAL]
+    values: list[float] = [internal]
+    extra_reasons: list[str] = []
+
+    edhrec_active = bool(edhrec_map)
+    deckcheck_active = bool(deckcheck_map)
+
+    if edhrec_active:
+        e_val, e_label = edhrec_signal(card_name, edhrec_map or {})
+        weights.append(WEIGHT_EDHREC)
+        values.append(e_val)
+        if e_label and e_val >= 0.2:
+            extra_reasons.append(e_label)
+    if deckcheck_active:
+        d_val, d_label = deckcheck_signal(card_name, deckcheck_map or {})
+        weights.append(WEIGHT_DECKCHECK)
+        values.append(d_val)
+        if d_label and d_val >= 0.15:
+            extra_reasons.append(d_label)
+
+    total = sum(weights)
+    blended = sum(w * v for w, v in zip(weights, values)) / total if total else internal
+    return blended, extra_reasons
+
+
+def apply_external_ranking(
+    suggestion: ScoredSuggestion,
+    edhrec_map: Optional[dict[str, dict[str, float]]],
+    deckcheck_map: Optional[dict[str, float]],
+) -> ScoredSuggestion:
+    blended, extra = blend_replacement_score(
+        suggestion.score,
+        suggestion.card.name,
+        edhrec_map,
+        deckcheck_map,
+    )
+    reasons = list(suggestion.reasons)
+    for label in extra:
+        if label not in reasons:
+            reasons.insert(0, label)
+    return ScoredSuggestion(
+        card=suggestion.card,
+        score=blended,
+        roles=suggestion.roles,
+        reasons=reasons,
+        owned=suggestion.owned,
+        wildcard_cost=suggestion.wildcard_cost,
+    )
 
 
 def score_replacement(
@@ -382,7 +446,6 @@ def score_replacement(
     owned: dict[str, int],
     active_role: Optional[str] = None,
     attribute_overrides: Optional[dict[str, bool]] = None,
-    edhrec_map: Optional[dict[str, dict[str, float]]] = None,
 ) -> ScoredSuggestion:
     src_roles = detect_roles(source.oracle_text)
     cand_roles = detect_roles(candidate.oracle_text)
@@ -517,8 +580,6 @@ def score_replacement(
         if not reasons:
             reasons.append("general functional fit")
 
-    score, reasons = _apply_edhrec_bonus(score, reasons, candidate.name, edhrec_map)
-
     return ScoredSuggestion(
         card=candidate,
         score=score,
@@ -635,22 +696,21 @@ def rescore_pool_by_names(
     active_role: Optional[str] = None,
     attribute_overrides: Optional[dict[str, bool]] = None,
     edhrec_map: Optional[dict[str, dict[str, float]]] = None,
+    deckcheck_map: Optional[dict[str, float]] = None,
 ) -> list[ScoredSuggestion]:
     scored: list[ScoredSuggestion] = []
     for name in names:
         cand = index.get(name)
         if not cand or cand.name == source.name:
             continue
-        scored.append(
-            score_replacement(
-                source,
-                cand,
-                owned,
-                active_role=active_role,
-                attribute_overrides=attribute_overrides,
-                edhrec_map=edhrec_map,
-            )
+        raw = score_replacement(
+            source,
+            cand,
+            owned,
+            active_role=active_role,
+            attribute_overrides=attribute_overrides,
         )
+        scored.append(apply_external_ranking(raw, edhrec_map, deckcheck_map))
     scored.sort(key=lambda x: -x.score)
     return scored
 
@@ -667,6 +727,8 @@ def suggest_from_pool(
     role_override: Optional[str] = None,
     attribute_overrides: Optional[dict[str, bool]] = None,
     edhrec_map: Optional[dict[str, dict[str, float]]] = None,
+    deckcheck_map: Optional[dict[str, float]] = None,
+    exclude: Optional[set[str]] = None,
 ) -> SuggestionRunResult:
     use_attributes = attribute_overrides is not None
     active_role = None if use_attributes else (role_override or None)
@@ -678,7 +740,10 @@ def suggest_from_pool(
         active_role=active_role,
         attribute_overrides=attribute_overrides,
         edhrec_map=edhrec_map,
+        deckcheck_map=deckcheck_map,
     )
+    if exclude:
+        scored = [s for s in scored if s.card.name not in exclude]
     if not scored:
         return SuggestionRunResult(suggestions=[], pool_names=[], pool_refresh="light")
     pool_out = [s.card.name for s in scored]
@@ -727,6 +792,7 @@ def suggest_replacements(
     attribute_overrides: Optional[dict[str, bool]] = None,
     scryfall_query: Optional[str] = None,
     edhrec_map: Optional[dict[str, dict[str, float]]] = None,
+    deckcheck_map: Optional[dict[str, float]] = None,
 ) -> SuggestionRunResult:
     """Pipeline: Brawl-legal candidates → attribute filters → Scryfall match → score → sort → page."""
     query_ast: Any = None
@@ -739,8 +805,9 @@ def suggest_replacements(
                 suggestions=[], query_error=str(exc), query_matched=0, pool_names=[], pool_refresh="full"
             )
 
-    use_attributes = attribute_overrides is not None
-    active_role = None if use_attributes else (role_override or None)
+    scryfall_mode = query_ast is not None
+    use_attributes = attribute_overrides is not None and not scryfall_mode
+    active_role = None if use_attributes else (None if scryfall_mode else (role_override or None))
 
     scored: list[ScoredSuggestion] = []
     matched_count = 0
@@ -751,23 +818,23 @@ def suggest_replacements(
             continue
         if source.is_brawler and not cand.is_brawler:
             continue
-        if not use_attributes and role_override and role_override not in detect_roles(cand.oracle_text):
+        if not scryfall_mode and not use_attributes and role_override and role_override not in detect_roles(cand.oracle_text):
             continue
-        if use_attributes and not candidate_matches_attribute_requirements(source, cand, attribute_overrides or {}):
+        if not scryfall_mode and use_attributes and not candidate_matches_attribute_requirements(
+            source, cand, attribute_overrides or {}
+        ):
             continue
         if query_ast and not card_matches(cand, query_ast):
             continue
         matched_count += 1
-        scored.append(
-            score_replacement(
-                source,
-                cand,
-                owned,
-                active_role=active_role,
-                attribute_overrides=attribute_overrides if use_attributes else None,
-                edhrec_map=edhrec_map,
-            )
+        raw = score_replacement(
+            source,
+            cand,
+            owned,
+            active_role=active_role,
+            attribute_overrides=attribute_overrides if use_attributes else None,
         )
+        scored.append(apply_external_ranking(raw, edhrec_map, deckcheck_map))
 
     if not scored:
         return SuggestionRunResult(

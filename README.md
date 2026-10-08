@@ -17,6 +17,8 @@ python -m uvicorn app.main:app --reload
 
 Open http://127.0.0.1:8000
 
+Optional: set `DECKCHECK_API_KEY` in the environment for DeckCheck deck-sample ranking (see [DeckCheck API](https://deckcheck.co/docs/api)). EDHREC commander data is fetched automatically without a key.
+
 ## Decklist format
 
 Paste Arena, Moxfield, or `1x Card Name` lists. Use `Commander` and `Deck` sections when possible.

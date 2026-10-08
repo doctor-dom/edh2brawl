@@ -20,7 +20,7 @@ body {
 }
 
 header, main, footer {
-  max-width: 1100px;
+  max-width: 1680px;
   margin: 0 auto;
   padding: 1rem 1.25rem;
 }
@@ -121,11 +121,26 @@ button.selected {
   font-size: 0.78rem;
 }
 
+.card-tile-lg {
+  width: 280px;
+  font-size: 0.88rem;
+}
+
 .card-tile img {
   width: 100%;
   border-radius: 6px;
   display: block;
   background: #000;
+}
+
+.card-tile img.selectable-art {
+  cursor: pointer;
+}
+
+.card-tile img.selectable-art:hover,
+.card-tile img.selectable-art:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .card-tile button {

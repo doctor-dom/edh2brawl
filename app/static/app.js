@@ -6,9 +6,10 @@ const state = {
   queryOverrides: {},
   rolls: {},
   cheapOverrides: {},
-  edhrecOverrides: {},
   poolNamesBySlot: {},
+  deferredSlots: {},
   edhrecStatus: "unavailable",
+  deckcheckStatus: "unavailable",
   lastAnalysis: null,
   analysisSnapshot: null,
   colorIdentity: "",
@@ -82,15 +83,28 @@ document.getElementById("collectionFile").addEventListener("change", async (ev) 
   }
 });
 
-function cardTile(card, onSelect, selectedName, selectable = true) {
+function cardTile(card, onSelect, selectedName, selectable = true, large = false) {
   const div = document.createElement("div");
-  div.className = "card-tile";
+  div.className = large ? "card-tile card-tile-lg" : "card-tile";
   if (selectedName === card.name) div.classList.add("card-tile-selected");
   const img = document.createElement("img");
   img.src = imageSrc(card);
   img.alt = card.name;
   img.loading = "lazy";
   img.referrerPolicy = "no-referrer";
+  if (selectable) {
+    img.classList.add("selectable-art");
+    img.tabIndex = 0;
+    img.title = `Select ${card.name}`;
+    const choose = () => onSelect(card);
+    img.addEventListener("click", choose);
+    img.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        choose();
+      }
+    });
+  }
   div.appendChild(img);
   const title = document.createElement("div");
   title.textContent = card.name;
@@ -265,7 +279,6 @@ function buildAnalyzeBody(commanderOverride) {
     query_overrides: state.queryOverrides,
     rolls: state.rolls,
     cheap_overrides: state.cheapOverrides,
-    edhrec_overrides: state.edhrecOverrides,
     pool_names_by_slot: {},
     prefer_collection: document.getElementById("preferCollection").checked,
     minimize_wildcards: document.getElementById("minimizeWildcards").checked,
@@ -292,7 +305,6 @@ function buildSlotRefreshBody(slots, mode = "full") {
     query_overrides: state.queryOverrides,
     rolls: state.rolls,
     cheap_overrides: state.cheapOverrides,
-    edhrec_overrides: state.edhrecOverrides,
     pool_names_by_slot,
     prefer_collection: document.getElementById("preferCollection").checked,
     minimize_wildcards: document.getElementById("minimizeWildcards").checked,
@@ -307,9 +319,6 @@ function ingestSlotMetaFromRows(rows, resetPools = false) {
     if (!slot) continue;
     if (row.suggestion_pool_names?.length) {
       state.poolNamesBySlot[slot] = row.suggestion_pool_names;
-    }
-    if (state.edhrecStatus === "ok" && state.edhrecOverrides[slot] === undefined) {
-      state.edhrecOverrides[slot] = row.prefer_edhrec !== false;
     }
   }
 }
@@ -335,7 +344,7 @@ function applyLocalPick(slotKey, card) {
     if (!list) continue;
     for (const row of list) {
       if (slotKeyForRow(row) !== slotKey) continue;
-      row.selected_replacement = { ...card };
+      row.selected_replacement = card ? { ...card } : null;
     }
   }
 }
@@ -358,8 +367,14 @@ function updateReplacementSummary() {
     summary.textContent = "";
     return;
   }
-  const pending = rows.filter((r) => !state.replacements[slotKeyForRow(r)]).length;
-  summary.textContent = `${rows.length} illegal slot(s), ${pending} still need a pick · deck size ${data.deck_size}/${data.expected_size}`;
+  const pending = rows.filter((r) => {
+    const sk = slotKeyForRow(r);
+    return !state.replacements[sk] && !state.deferredSlots[sk];
+  }).length;
+  const deferredN = rows.filter((r) => state.deferredSlots[slotKeyForRow(r)]).length;
+  let summaryText = `${rows.length} illegal slot(s), ${pending} still need a pick · deck size ${data.deck_size}/${data.expected_size}`;
+  if (deferredN) summaryText += ` · ${deferredN} decide later`;
+  summary.textContent = summaryText;
 }
 
 function slotsToRefreshOnPick(slotKey, cardName, row) {
@@ -380,7 +395,7 @@ function slotsToRefreshOnPick(slotKey, cardName, row) {
 function pendingSlotKeys() {
   return allReplacementRows()
     .map((r) => slotKeyForRow(r))
-    .filter((sk) => !state.replacements[sk]);
+    .filter((sk) => !state.replacements[sk] && !state.deferredSlots[sk]);
 }
 
 function allSlotsFilled() {
@@ -422,6 +437,7 @@ async function refreshSlots(slots, { partial = false, mode = "full" } = {}) {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     if (data.edhrec) state.edhrecStatus = data.edhrec;
+    if (data.deckcheck) state.deckcheckStatus = data.deckcheck;
     const updated = data.rows || [];
     mergeSlotRows(updated);
     ingestSlotMetaFromRows(updated);
@@ -463,15 +479,20 @@ async function refreshPartialExport() {
         snapshot: state.analysisSnapshot,
         format_key: state.formatKey,
         replacements: state.replacements,
+        deferred_slots: Object.keys(state.deferredSlots).filter((k) => state.deferredSlots[k]),
       }),
     });
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     const n = data.pending_count || 0;
-    const hint =
-      n === 0
+    const later = data.decide_later || [];
+    let hint =
+      n === 0 && !later.length
         ? "All replacement slots filled — use Final Brawl deck below for the clean Arena import."
         : `${n} slot(s) still need a pick. Picks applied; unpicked illegal cards remain in the list. Remove # comment lines before Arena import.`;
+    if (later.length) {
+      hint += ` Decide later (${later.join(", ")}): omitted from the deck list below.`;
+    }
     setPartialExportUi(data.arena_export || "", hint);
   } catch (err) {
     setPartialExportUi("", `Could not build partial export: ${err.message || err}`);
@@ -600,8 +621,9 @@ async function runFullAnalyze(commanderOverride) {
   state.analysisSnapshot = data.analysis_snapshot;
   state.colorIdentity = data.color_identity || "";
   state.edhrecStatus = data.edhrec || "unavailable";
+  state.deckcheckStatus = data.deckcheck || "unavailable";
   state.poolNamesBySlot = {};
-  state.edhrecOverrides = {};
+  state.deferredSlots = {};
   ingestSlotMetaFromRows([
     ...(data.replacement_rows || []),
     ...(data.sideboard_replacement_rows || []),
@@ -646,29 +668,14 @@ function renderSideboard(data) {
   const row = document.getElementById("sideboardCards");
   const summary = document.getElementById("sideboardSummary");
   const illegalRows = document.getElementById("sideboardReplacementRows");
-  const cards = data.sideboard_review || [];
   const replacements = data.sideboard_replacement_rows || [];
-  if (!cards.length && !replacements.length) {
+  if (!replacements.length) {
     section.classList.add("hidden");
     return;
   }
   section.classList.remove("hidden");
-  const legal = cards.filter((c) => c.status === "legal").length;
-  summary.textContent = `${cards.length} sideboard card(s) — ${legal} legal, ${replacements.length} need an Arena replacement. Your picks are exported with the deck as Sideboard.`;
-  row.innerHTML = "";
-  for (const entry of cards) {
-    if (entry.status !== "legal") continue;
-    const tile = cardTile(entry.card, () => {}, null, false);
-    const badge = document.createElement("span");
-    badge.className = "badge badge-legal";
-    badge.textContent = "Legal";
-    tile.appendChild(badge);
-    const r = document.createElement("div");
-    r.className = "reasons";
-    r.textContent = entry.reason || "";
-    tile.appendChild(r);
-    row.appendChild(tile);
-  }
+  summary.textContent = `${replacements.length} illegal sideboard card(s) need an Arena replacement. Legal sideboard cards stay in the exported sideboard.`;
+  if (row) row.innerHTML = "";
   illegalRows.innerHTML = "";
   for (const repl of replacements) {
     illegalRows.appendChild(renderReplacementBlock(repl));
@@ -683,8 +690,8 @@ function slotKeyForRow(row) {
 function appendRerollAndCheapButtons(wrap, slotKey, row) {
   const reroll = document.createElement("button");
   reroll.type = "button";
-  reroll.textContent = "Show next 4";
-  reroll.title = "Cycle through the top 12 ranked replacements (4 at a time)";
+  reroll.textContent = "Show next 5";
+  reroll.title = "Cycle through the top 20 ranked replacements (5 at a time)";
   reroll.addEventListener("click", () => {
     state.rolls[slotKey] = (state.rolls[slotKey] || 0) + 1;
     refreshSlots([slotKey], { partial: true, mode: "light" });
@@ -705,24 +712,6 @@ function appendRerollAndCheapButtons(wrap, slotKey, row) {
   });
   wrap.appendChild(cheap);
 
-  const edhrecWrap = document.createElement("label");
-  edhrecWrap.className = "edhrec-pref";
-  const edhrecCb = document.createElement("input");
-  edhrecCb.type = "checkbox";
-  const edhrecOn =
-    slotKey in state.edhrecOverrides
-      ? state.edhrecOverrides[slotKey]
-      : row.prefer_edhrec !== false;
-  edhrecCb.checked = edhrecOn;
-  edhrecCb.disabled = !(row.edhrec_available || state.edhrecStatus === "ok");
-  edhrecCb.addEventListener("change", () => {
-    state.edhrecOverrides[slotKey] = edhrecCb.checked;
-    state.rolls[slotKey] = 0;
-    refreshSlots([slotKey], { partial: true, mode: "light" });
-  });
-  edhrecWrap.appendChild(edhrecCb);
-  edhrecWrap.append(" Prefer EDHREC");
-  wrap.appendChild(edhrecWrap);
 }
 
 function buildSlotActions(row, slotKey) {
@@ -746,9 +735,21 @@ function renderReplacements(data) {
   section.classList.remove("hidden");
   const pending = rows.filter((r) => {
     const sk = slotKeyForRow(r);
-    return !state.replacements[sk];
+    return !state.replacements[sk] && !state.deferredSlots[sk];
   }).length;
-  summary.textContent = `${rows.length} illegal slot(s), ${pending} still need a pick · deck size ${data.deck_size}/${data.expected_size}`;
+  const deferredN = rows.filter((r) => state.deferredSlots[slotKeyForRow(r)]).length;
+  let summaryText = `${rows.length} illegal slot(s), ${pending} still need a pick · deck size ${data.deck_size}/${data.expected_size}`;
+  if (deferredN) summaryText += ` · ${deferredN} decide later`;
+  summary.textContent = summaryText;
+  const rankStatus = document.getElementById("rankingStatus");
+  if (rankStatus) {
+    const edh = state.edhrecStatus === "ok" || state.edhrecStatus === "cached" ? "EDHREC on" : "EDHREC off";
+    const dc =
+      state.deckcheckStatus === "ok" || state.deckcheckStatus === "cached"
+        ? "DeckCheck on"
+        : "DeckCheck off";
+    rankStatus.textContent = `Ranking: internal fit + ${edh} + ${dc}.`;
+  }
   rowsEl.innerHTML = "";
 
   for (const row of rows) {
@@ -777,10 +778,32 @@ function renderReplacementBlock(row) {
   }
 
     const selected = state.replacements[slotKey];
+    const deferred = !!state.deferredSlots[slotKey];
 
-    if (row.noticed_attributes?.length) {
+    const decideWrap = document.createElement("label");
+    decideWrap.className = "decide-later-pref";
+    const decideCb = document.createElement("input");
+    decideCb.type = "checkbox";
+    decideCb.checked = deferred;
+    decideCb.addEventListener("change", () => {
+      if (decideCb.checked) {
+        state.deferredSlots[slotKey] = true;
+        delete state.replacements[slotKey];
+        applyLocalPick(slotKey, null);
+      } else {
+        delete state.deferredSlots[slotKey];
+      }
+      replaceReplacementBlock(slotKey);
+      updateReplacementSummary();
+      refreshPartialExport();
+    });
+    decideWrap.appendChild(decideCb);
+    decideWrap.append(" Will decide later");
+    block.appendChild(decideWrap);
+
+    if (!deferred && row.noticed_attributes?.length) {
       block.appendChild(buildAttributePanel(row, slotKey));
-    } else if ((row.suggestions || []).length) {
+    } else if (!deferred && (row.suggestions || []).length) {
       block.appendChild(buildSlotActions(row, slotKey));
     }
 
@@ -790,7 +813,7 @@ function renderReplacementBlock(row) {
     illegalLabel.className = "row-label";
     illegalLabel.textContent = "Illegal / unavailable";
     block.appendChild(illegalLabel);
-    illegalRow.appendChild(cardTile(row.illegal, () => {}, null, false));
+    illegalRow.appendChild(cardTile(row.illegal, () => {}, null, false, true));
     block.appendChild(illegalRow);
 
     if (row.selected_replacement || selected) {
@@ -807,32 +830,37 @@ function renderReplacementBlock(row) {
             { ...picked, owned: (state.owned[picked.name] || 0) >= 1 },
             () => {},
             selected,
-            false
+            false,
+            true
           )
         );
       }
       block.appendChild(pickedRow);
     }
 
-    const sugLabel = document.createElement("div");
-    sugLabel.className = "row-label";
-    sugLabel.textContent = "Legal replacements (pick one)";
-    block.appendChild(sugLabel);
+    if (!deferred) {
+      const sugLabel = document.createElement("div");
+      sugLabel.className = "row-label";
+      sugLabel.textContent = "Legal replacements (pick one)";
+      block.appendChild(sugLabel);
 
-    const sugRow = document.createElement("div");
-    sugRow.className = "card-row";
-    for (const sug of row.suggestions || []) {
-      sugRow.appendChild(
-        cardTile(
-          { ...sug, owned: sug.owned || (state.owned[sug.name] || 0) >= 1 },
-          (card) => {
-            onPickReplacement(slotKey, card, row);
-          },
-          selected
-        )
-      );
+      const sugRow = document.createElement("div");
+      sugRow.className = "card-row";
+      for (const sug of row.suggestions || []) {
+        sugRow.appendChild(
+          cardTile(
+            { ...sug, owned: sug.owned || (state.owned[sug.name] || 0) >= 1 },
+            (card) => {
+              onPickReplacement(slotKey, card, row);
+            },
+            selected,
+            true,
+            true
+          )
+        );
+      }
+      block.appendChild(sugRow);
     }
-    block.appendChild(sugRow);
   return block;
 }
 
@@ -887,7 +915,7 @@ document.getElementById("analyzeBtn").addEventListener("click", () => {
   state.queryOverrides = {};
   state.rolls = {};
   state.cheapOverrides = {};
-  state.edhrecOverrides = {};
+  state.deferredSlots = {};
   state.poolNamesBySlot = {};
   runFullAnalyze();
 });

@@ -13,7 +13,6 @@ from app.suggest import (
     AVAILABLE_ROLES,
     SuggestionRunResult,
     default_major_role,
-    edhrec_map_for_slot,
     noticed_attributes,
     source_attributes,
     singleton_exempt,
@@ -41,10 +40,11 @@ def _run_slot_suggestions(
     attribute_overrides_slot: Optional[dict[str, bool]],
     scryfall_query: Optional[str],
     edhrec_map: dict[str, dict[str, float]] | None,
-    edhrec_overrides: dict[str, bool],
+    deckcheck_map: dict[str, float] | None,
     pool_names_by_slot: dict[str, list[str]],
 ) -> SuggestionRunResult:
-    emap = edhrec_map_for_slot(edhrec_map, edhrec_overrides, slot)
+    query_active = bool((scryfall_query or "").strip())
+    attr = None if query_active else attribute_overrides_slot
     pool = pool_names_by_slot.get(slot)
     if pool:
         return suggest_from_pool(
@@ -56,8 +56,10 @@ def _run_slot_suggestions(
             cheap_slot,
             page=page,
             role_override=role_override or None,
-            attribute_overrides=attribute_overrides_slot,
-            edhrec_map=emap,
+            attribute_overrides=attr,
+            edhrec_map=edhrec_map,
+            deckcheck_map=deckcheck_map,
+            exclude=exclude,
         )
     return suggest_replacements(
         index,
@@ -70,9 +72,10 @@ def _run_slot_suggestions(
         cheap_slot,
         role_override=role_override or None,
         page=page,
-        attribute_overrides=attribute_overrides_slot,
+        attribute_overrides=attr,
         scryfall_query=scryfall_query,
-        edhrec_map=emap,
+        edhrec_map=edhrec_map,
+        deckcheck_map=deckcheck_map,
     )
 
 
@@ -118,18 +121,42 @@ def build_exclude(
     legal_main: list[CardRecord],
     replacements: dict[str, str],
     index: CardIndex,
+    also_in_list: list[str] | None = None,
 ) -> set[str]:
     used: set[str] = set()
+
+    def add_name(name: str) -> None:
+        if not name:
+            return
+        rec = resolve_name(index, name)
+        if rec:
+            if not singleton_exempt(rec):
+                used.add(rec.name)
+        else:
+            used.add(name)
+
     if commander:
-        used.add(commander.name)
+        add_name(commander.name)
     for c in legal_main:
-        if not singleton_exempt(c):
-            used.add(c.name)
+        add_name(c.name)
+    for name in also_in_list or []:
+        add_name(name)
     for _old, new_name in replacements.items():
-        rec = index.get(new_name)
-        if rec and not singleton_exempt(rec):
-            used.add(rec.name)
+        add_name(new_name)
     return used
+
+
+def names_already_in_list(
+    analysis: DeckAnalysis,
+    sideboard_review: list[dict] | None = None,
+) -> list[str]:
+    """Card names already occupying the deck or sideboard, including illegal ones."""
+    names = [entry.name for entry in analysis.illegal]
+    for entry in sideboard_review or []:
+        name = entry.get("name")
+        if name:
+            names.append(name)
+    return names
 
 
 def analyze_deck(
@@ -454,11 +481,11 @@ def build_replacement_row_for_slot(
     query_overrides: dict[str, str],
     edhrec_map: dict[str, dict[str, float]] | None,
     linked_counts: dict[str, int],
-    edhrec_overrides: dict[str, bool] | None = None,
     pool_names_by_slot: dict[str, list[str]] | None = None,
     edhrec_available: bool = False,
+    deckcheck_map: dict[str, float] | None = None,
+    deckcheck_available: bool = False,
 ) -> dict:
-    edhrec_overrides = edhrec_overrides or {}
     pool_names_by_slot = pool_names_by_slot or {}
     specs = _slot_specs_from_snapshot(snapshot)
     spec = specs.get(slot)
@@ -470,7 +497,13 @@ def build_replacement_row_for_slot(
 
     analysis = _deck_analysis_from_snapshot(index, snapshot)
     commander = analysis.commander
-    exclude = build_exclude(commander, analysis.legal_main, replacements, index)
+    exclude = build_exclude(
+        commander,
+        analysis.legal_main,
+        replacements,
+        index,
+        names_already_in_list(analysis, snapshot.get("sideboard_review") or []),
+    )
     ci = analysis.color_identity
     zone = spec.get("zone") or "main"
     illegal_name = spec["illegal_name"]
@@ -550,7 +583,7 @@ def build_replacement_row_for_slot(
         attribute_overrides.get(slot) if slot in attribute_overrides else None,
         query_overrides.get(slot),
         edhrec_map,
-        edhrec_overrides,
+        deckcheck_map,
         pool_names_by_slot,
     )
     selected = None
@@ -575,8 +608,8 @@ def build_replacement_row_for_slot(
         occurrence_index=occurrence_index,
         linked_count=linked_count,
         suggestion_pool_names=run.pool_names,
-        prefer_edhrec=edhrec_overrides.get(slot, True),
         edhrec_available=edhrec_available,
+        deckcheck_available=deckcheck_available,
         pool_refresh=run.pool_refresh,
     )
     row["zone"] = zone
@@ -598,16 +631,16 @@ def refresh_suggestion_slots(
     attribute_overrides: dict[str, dict[str, bool]] | None = None,
     query_overrides: dict[str, str] | None = None,
     edhrec_map: dict[str, dict[str, float]] | None = None,
-    edhrec_overrides: dict[str, bool] | None = None,
     pool_names_by_slot: dict[str, list[str]] | None = None,
     edhrec_available: bool = False,
+    deckcheck_map: dict[str, float] | None = None,
+    deckcheck_available: bool = False,
 ) -> list[dict]:
     role_overrides = role_overrides or {}
     rolls = rolls or {}
     cheap_overrides = cheap_overrides or {}
     attribute_overrides = attribute_overrides or {}
     query_overrides = query_overrides or {}
-    edhrec_overrides = edhrec_overrides or {}
     pool_names_by_slot = pool_names_by_slot or {}
     analysis = _deck_analysis_from_snapshot(index, snapshot)
     linked_counts = _linked_counts_for_entries([e for e in analysis.illegal if not e.is_commander])
@@ -635,9 +668,10 @@ def refresh_suggestion_slots(
                     query_overrides,
                     edhrec_map,
                     linked_counts,
-                    edhrec_overrides,
                     pool_names_by_slot,
                     edhrec_available,
+                    deckcheck_map,
+                    deckcheck_available,
                 )
             )
         except KeyError:
@@ -660,9 +694,10 @@ def build_sideboard_suggestion_rows(
     attribute_overrides: dict[str, dict[str, bool]] | None = None,
     query_overrides: dict[str, str] | None = None,
     edhrec_map: dict[str, dict[str, float]] | None = None,
-    edhrec_overrides: dict[str, bool] | None = None,
     pool_names_by_slot: dict[str, list[str]] | None = None,
     edhrec_available: bool = False,
+    deckcheck_map: dict[str, float] | None = None,
+    deckcheck_available: bool = False,
 ) -> list[dict]:
     """Same replacement flow as the main deck, for sideboard cards that are not Brawl-legal."""
     role_overrides = role_overrides or {}
@@ -670,14 +705,19 @@ def build_sideboard_suggestion_rows(
     cheap_overrides = cheap_overrides or {}
     attribute_overrides = attribute_overrides or {}
     query_overrides = query_overrides or {}
-    edhrec_overrides = edhrec_overrides or {}
     pool_names_by_slot = pool_names_by_slot or {}
 
     def cheap_for_slot(slot_key: str) -> bool:
         return minimize_wildcards or cheap_overrides.get(slot_key, False)
 
     commander = analysis.commander
-    exclude = build_exclude(commander, analysis.legal_main, replacements, index)
+    exclude = build_exclude(
+        commander,
+        analysis.legal_main,
+        replacements,
+        index,
+        names_already_in_list(analysis, sideboard_review),
+    )
     ci = analysis.color_identity
     sb_occ: dict[str, int] = defaultdict(int)
     sb_linked = _sideboard_link_counts(sideboard_review)
@@ -728,7 +768,7 @@ def build_sideboard_suggestion_rows(
             attribute_overrides.get(slot) if slot in attribute_overrides else None,
             query_overrides.get(slot),
             edhrec_map,
-            edhrec_overrides,
+            deckcheck_map,
             pool_names_by_slot,
         )
         selected_name = replacements.get(slot)
@@ -753,8 +793,8 @@ def build_sideboard_suggestion_rows(
             occurrence_index=occ,
             linked_count=sb_linked.get(link_group, 1),
             suggestion_pool_names=run.pool_names,
-            prefer_edhrec=edhrec_overrides.get(slot, True),
             edhrec_available=edhrec_available,
+            deckcheck_available=deckcheck_available,
             pool_refresh=run.pool_refresh,
         )
         row["zone"] = "sideboard"
@@ -776,24 +816,32 @@ def build_suggestion_payload(
     attribute_overrides: dict[str, dict[str, bool]] | None = None,
     query_overrides: dict[str, str] | None = None,
     edhrec_map: dict[str, dict[str, float]] | None = None,
-    edhrec_overrides: dict[str, bool] | None = None,
     pool_names_by_slot: dict[str, list[str]] | None = None,
     edhrec_available: bool = False,
+    deckcheck_map: dict[str, float] | None = None,
+    deckcheck_available: bool = False,
+    sideboard_review: list[dict] | None = None,
 ) -> list[dict]:
     role_overrides = role_overrides or {}
     rolls = rolls or {}
     cheap_overrides = cheap_overrides or {}
     attribute_overrides = attribute_overrides or {}
     query_overrides = query_overrides or {}
-    edhrec_overrides = edhrec_overrides or {}
     pool_names_by_slot = pool_names_by_slot or {}
+    sideboard_review = sideboard_review or []
 
     def cheap_for_slot(slot_key: str) -> bool:
         return minimize_wildcards or cheap_overrides.get(slot_key, False)
     commander = analysis.commander
     if commander and any(i.is_commander for i in analysis.illegal):
         slot_key = COMMANDER_SLOT_KEY
-        exclude = build_exclude(None, [], replacements, index)
+        exclude = build_exclude(
+            commander,
+            analysis.legal_main,
+            replacements,
+            index,
+            names_already_in_list(analysis, sideboard_review),
+        )
         page = rolls.get(slot_key, 0)
         role_override = role_overrides.get(slot_key)
         brawlers = suggest_brawlers(
@@ -829,7 +877,13 @@ def build_suggestion_payload(
         ]
 
     rows: list[dict] = []
-    exclude = build_exclude(commander, analysis.legal_main, replacements, index)
+    exclude = build_exclude(
+        commander,
+        analysis.legal_main,
+        replacements,
+        index,
+        names_already_in_list(analysis, sideboard_review),
+    )
     ci = analysis.color_identity
     linked_counts = _linked_counts_for_entries([e for e in analysis.illegal if not e.is_commander])
 
@@ -874,7 +928,7 @@ def build_suggestion_payload(
             attribute_overrides.get(slot_key) if slot_key in attribute_overrides else None,
             query_overrides.get(slot_key),
             edhrec_map,
-            edhrec_overrides,
+            deckcheck_map,
             pool_names_by_slot,
         )
         selected_name = replacements.get(slot_key)
@@ -900,8 +954,8 @@ def build_suggestion_payload(
                 occurrence_index=entry.occurrence_index,
                 linked_count=linked_counts.get(entry.link_group, 1),
                 suggestion_pool_names=run.pool_names,
-                prefer_edhrec=edhrec_overrides.get(slot_key, True),
                 edhrec_available=edhrec_available,
+                deckcheck_available=deckcheck_available,
                 pool_refresh=run.pool_refresh,
             )
         )
@@ -925,8 +979,8 @@ def _replacement_row(
     occurrence_index: int = 0,
     linked_count: int = 1,
     suggestion_pool_names: list[str] | None = None,
-    prefer_edhrec: bool = True,
     edhrec_available: bool = False,
+    deckcheck_available: bool = False,
     pool_refresh: str = "full",
 ) -> dict:
     active = role_override or default_major_role(illegal)
@@ -949,8 +1003,8 @@ def _replacement_row(
         "occurrence_index": occurrence_index,
         "linked_count": linked_count,
         "suggestion_pool_names": suggestion_pool_names or [],
-        "prefer_edhrec": prefer_edhrec,
         "edhrec_available": edhrec_available,
+        "deckcheck_available": deckcheck_available,
         "pool_refresh": pool_refresh,
     }
 
@@ -1001,13 +1055,31 @@ def _suggestion_json(s) -> dict:
     }
 
 
+def decide_later_illegal_names(
+    snapshot: dict[str, Any],
+    deferred_slots: set[str] | list[str],
+) -> list[str]:
+    deferred = set(deferred_slots or [])
+    if not deferred:
+        return []
+    specs = _slot_specs_from_snapshot(snapshot)
+    names: list[str] = []
+    for slot in sorted(deferred):
+        spec = specs.get(slot)
+        if spec and spec.get("illegal_name"):
+            names.append(spec["illegal_name"])
+    return names
+
+
 def build_partial_deck(
     analysis: DeckAnalysis,
     replacements: dict[str, str],
     index: CardIndex,
     sideboard_review: list[dict],
+    deferred_slots: set[str] | None = None,
 ) -> dict:
     """Apply chosen replacements; unpicked illegal slots keep the original illegal card."""
+    deferred = deferred_slots or set()
     commander_name = replacements.get(COMMANDER_SLOT_KEY) or analysis.commander_name
     commander = resolve_name(index, commander_name) if commander_name else None
 
@@ -1016,6 +1088,8 @@ def build_partial_deck(
         if entry.is_commander:
             continue
         slot = entry.slot or entry.name
+        if slot in deferred:
+            continue
         if slot in replacements:
             rec = resolve_name(index, replacements[slot])
             if rec:
@@ -1028,7 +1102,7 @@ def build_partial_deck(
     if commander:
         deck_list = [c for c in main_cards if c.name != commander.name]
 
-    sideboard = build_partial_export_sideboard(sideboard_review, replacements, index)
+    sideboard = build_partial_export_sideboard(sideboard_review, replacements, index, deferred)
 
     return {
         "commander": _card_json(commander) if commander else None,
@@ -1043,7 +1117,9 @@ def build_partial_export_sideboard(
     sideboard_review: list[dict],
     replacements: dict[str, str],
     index: CardIndex,
+    deferred_slots: set[str] | None = None,
 ) -> list[dict]:
+    deferred = deferred_slots or set()
     out: list[dict] = []
     sb_occ: dict[str, int] = defaultdict(int)
     for entry in sideboard_review:
@@ -1055,6 +1131,8 @@ def build_partial_export_sideboard(
             occ = sb_occ[name]
             sb_occ[name] += 1
             slot = sideboard_slot_key(name, occ)
+            if slot in deferred:
+                continue
             picked = replacements.get(slot)
             if picked:
                 rec = resolve_name(index, picked)
@@ -1067,9 +1145,14 @@ def build_partial_export_sideboard(
     return out
 
 
-def pending_replacement_slots(snapshot: dict[str, Any], replacements: dict[str, str]) -> list[str]:
+def pending_replacement_slots(
+    snapshot: dict[str, Any],
+    replacements: dict[str, str],
+    deferred_slots: set[str] | None = None,
+) -> list[str]:
+    deferred = deferred_slots or set()
     specs = _slot_specs_from_snapshot(snapshot)
-    return sorted(slot for slot in specs if slot not in replacements)
+    return sorted(slot for slot in specs if slot not in replacements and slot not in deferred)
 
 
 def build_final_deck(

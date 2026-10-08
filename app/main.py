@@ -21,6 +21,7 @@ from app.legality import (
     build_analysis_snapshot,
     build_export_sideboard,
     build_partial_deck,
+    decide_later_illegal_names,
     pending_replacement_slots,
     build_final_deck,
     build_sideboard_suggestion_rows,
@@ -30,6 +31,7 @@ from app.legality import (
     resolve_name,
     _deck_analysis_from_snapshot,
 )
+from app.deckcheck import fetch_commander_inclusion
 from app.edhrec import fetch_commander_synergy
 from app.suggest import suggest_replacements
 
@@ -164,9 +166,13 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
     edhrec_map: dict[str, dict[str, float]] = {}
     edhrec_status = "unavailable"
     commander_for_edhrec = body.replacements.get(COMMANDER_SLOT_KEY) or analysis.commander_name
+    deckcheck_map: dict[str, float] = {}
+    deckcheck_status = "unavailable"
     if commander_for_edhrec:
         edhrec_map, edhrec_status = fetch_commander_synergy(commander_for_edhrec)
-    edhrec_available = edhrec_status == "ok" and bool(edhrec_map)
+        deckcheck_map, deckcheck_status = fetch_commander_inclusion(commander_for_edhrec)
+    edhrec_available = edhrec_status in ("ok", "cached") and bool(edhrec_map)
+    deckcheck_available = deckcheck_status in ("ok", "cached") and bool(deckcheck_map)
 
     rows: list[dict] = []
     sideboard_rows: list[dict] = []
@@ -185,9 +191,11 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
             body.attribute_overrides,
             body.query_overrides,
             edhrec_map,
-            body.edhrec_overrides,
             body.pool_names_by_slot,
             edhrec_available,
+            deckcheck_map,
+            deckcheck_available,
+            sideboard_review,
         )
         sideboard_rows = build_sideboard_suggestion_rows(
             idx,
@@ -204,9 +212,10 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
             body.attribute_overrides,
             body.query_overrides,
             edhrec_map,
-            body.edhrec_overrides,
             body.pool_names_by_slot,
             edhrec_available,
+            deckcheck_map,
+            deckcheck_available,
         )
 
     pending = []
@@ -248,6 +257,7 @@ def analyze(body: AnalyzeRequest) -> dict[str, Any]:
         "sideboard_replacement_rows": sideboard_rows,
         "arena_export": _arena_export(final) if final else None,
         "edhrec": edhrec_status,
+        "deckcheck": deckcheck_status,
         "analysis_snapshot": snapshot,
     }
 
@@ -260,9 +270,13 @@ def suggest_slots(body: SuggestSlotsRequest) -> dict[str, Any]:
     edhrec_map: dict[str, dict[str, float]] = {}
     edhrec_status = "unavailable"
     commander_name = body.snapshot.get("commander_name") or body.replacements.get(COMMANDER_SLOT_KEY)
+    deckcheck_map: dict[str, float] = {}
+    deckcheck_status = "unavailable"
     if commander_name:
         edhrec_map, edhrec_status = fetch_commander_synergy(commander_name)
-    edhrec_available = edhrec_status == "ok" and bool(edhrec_map)
+        deckcheck_map, deckcheck_status = fetch_commander_inclusion(commander_name)
+    edhrec_available = edhrec_status in ("ok", "cached") and bool(edhrec_map)
+    deckcheck_available = deckcheck_status in ("ok", "cached") and bool(deckcheck_map)
     rows = refresh_suggestion_slots(
         idx,
         body.snapshot,
@@ -278,17 +292,19 @@ def suggest_slots(body: SuggestSlotsRequest) -> dict[str, Any]:
         body.attribute_overrides,
         body.query_overrides,
         edhrec_map,
-        body.edhrec_overrides,
         body.pool_names_by_slot,
         edhrec_available,
+        deckcheck_map,
+        deckcheck_available,
     )
-    return {"rows": rows, "edhrec": edhrec_status}
+    return {"rows": rows, "edhrec": edhrec_status, "deckcheck": deckcheck_status}
 
 
 class PartialExportRequest(BaseModel):
     snapshot: dict[str, Any]
     format_key: str = Field(default="brawl", pattern="^(brawl|competitivebrawl)$")
     replacements: dict[str, str] = Field(default_factory=dict)
+    deferred_slots: list[str] = Field(default_factory=list)
 
 
 @app.post("/api/export/partial")
@@ -296,13 +312,16 @@ def export_partial(body: PartialExportRequest) -> dict[str, Any]:
     idx = get_index()
     analysis = _deck_analysis_from_snapshot(idx, body.snapshot)
     sideboard_review = body.snapshot.get("sideboard_review") or []
-    partial = build_partial_deck(analysis, body.replacements, idx, sideboard_review)
-    pending = pending_replacement_slots(body.snapshot, body.replacements)
+    deferred = set(body.deferred_slots)
+    partial = build_partial_deck(analysis, body.replacements, idx, sideboard_review, deferred)
+    pending = pending_replacement_slots(body.snapshot, body.replacements, deferred)
+    decide_later = decide_later_illegal_names(body.snapshot, deferred)
     return {
         "partial_deck": partial,
-        "arena_export": _arena_export(partial, pending_slots=pending),
+        "arena_export": _arena_export(partial, pending_slots=pending, decide_later=decide_later),
         "pending_slots": pending,
         "pending_count": len(pending),
+        "decide_later": decide_later,
     }
 
 
@@ -421,7 +440,11 @@ def _wildcard_summary(final: dict, owned: dict[str, int], idx) -> dict[str, int]
     return counts
 
 
-def _arena_export(final: dict, pending_slots: list[str] | None = None) -> str:
+def _arena_export(
+    final: dict,
+    pending_slots: list[str] | None = None,
+    decide_later: list[str] | None = None,
+) -> str:
     lines: list[str] = []
     if final.get("commander"):
         lines.append("Commander")
@@ -436,9 +459,15 @@ def _arena_export(final: dict, pending_slots: list[str] | None = None) -> str:
         lines.append("Sideboard")
         for c in sideboard:
             lines.append(f"1 {c['name']}")
+    if decide_later:
+        lines.append("")
+        lines.append("# Decide later:")
+        for name in decide_later:
+            lines.append(f"#   {name}")
     if pending_slots:
         lines.append("")
         lines.append(f"# Incomplete: {len(pending_slots)} slot(s) still need an Arena replacement.")
-        for slot in pending_slots:
+        specs_pending = pending_slots
+        for slot in specs_pending:
             lines.append(f"#   {slot}")
     return "\n".join(lines)

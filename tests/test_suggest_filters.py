@@ -335,7 +335,9 @@ def test_scryfall_trampler_query():
     assert "High CMC Trampler" not in names
 
 
-def test_edhrec_bonus_orders_synergy_card():
+def test_edhrec_blend_orders_synergy_card():
+    from app.suggest import apply_external_ranking
+
     src = _card("Source", "Draw a card.", 2, "Instant")
     a = _card("Synergy Test", "Draw a card.", 2, "Instant")
     b = _card("Plain Instant", "Draw a card.", 2, "Instant")
@@ -343,8 +345,8 @@ def test_edhrec_bonus_orders_synergy_card():
     base_b = score_replacement(src, b, {})
     assert abs(base_a.score - base_b.score) < 0.001
     edhrec = {"Synergy Test": {"synergy": 40.0, "inclusion": 0.5}}
-    boosted = score_replacement(src, a, {}, edhrec_map=edhrec)
-    plain = score_replacement(src, b, {}, edhrec_map=edhrec)
+    boosted = apply_external_ranking(base_a, edhrec, None)
+    plain = apply_external_ranking(base_b, edhrec, None)
     assert boosted.score > plain.score
     bonus, label = edhrec_score_bonus("Synergy Test", edhrec)
     assert bonus > 0 and label

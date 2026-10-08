@@ -81,6 +81,70 @@ SIDEBOARD
     assert by_name["Rhystic Study"]["status"] == "illegal"
 
 
+def test_suggestions_omit_cards_already_in_deck_or_sideboard():
+    from app.legality import build_sideboard_suggestion_rows, build_suggestion_payload
+
+    idx = _fixture_index()
+    conn = idx.connect()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO cards(
+            name, oracle_text, mana_value, type_line, keywords, color_identity,
+            power, toughness, brawl, competitivebrawl, image_url, rarity,
+            is_brawler, layout
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "Opt",
+            "Draw a card.",
+            1,
+            "Instant",
+            "",
+            "U",
+            None,
+            None,
+            "legal",
+            "legal",
+            "",
+            "common",
+            0,
+            "normal",
+        ),
+    )
+    conn.commit()
+    parsed = parse_decklist(
+        """Commander
+1 Baral, Chief of Compliance
+
+Deck
+1 Counterspell
+1 Rhystic Study
+
+SIDEBOARD
+1 Arcane Denial
+1 Sol Ring
+"""
+    )
+    analysis = analyze_deck(idx, parsed, "brawl")
+    review = analyze_sideboard(idx, parsed.sideboard, "brawl", analysis.color_identity)
+    main_rows = build_suggestion_payload(
+        idx, analysis, "brawl", {}, {}, False, False, sideboard_review=review
+    )
+    sb_rows = build_sideboard_suggestion_rows(
+        idx, review, analysis, "brawl", {}, {}, False, False
+    )
+    suggested = {
+        s["name"]
+        for row in main_rows + sb_rows
+        for s in row["suggestions"]
+    }
+    assert "Counterspell" not in suggested
+    assert "Arcane Denial" not in suggested
+    assert "Sol Ring" not in suggested
+    assert "Baral, Chief of Compliance" not in suggested
+    assert "Opt" in suggested
+
+
 def test_illegal_sideboard_gets_replacement_rows():
     from app.legality import build_sideboard_suggestion_rows
 
